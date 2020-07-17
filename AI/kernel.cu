@@ -1,5 +1,19 @@
+﻿#define THE_VERSION_JULIAN_DID_NOT_SCREW_WITH
+#ifdef __NVCC__
+#pragma warning( disable : 4514)
+#pragma warning( disable : 4711)
+#pragma warning( disable : 4710)
+#pragma warning( disable : 5039)
+#endif
+
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <curand_kernel.h>
+#include <cooperative_groups.h>
+//#include <mma.h>
+//#include <cublasXt.h>
 
 #include <algorithm>
 #include <stdio.h>
@@ -8,444 +22,1078 @@
 #include <fcntl.h>
 #include <typeinfo>
 #include <inttypes.h>
-#include <cublas_v2.h>
-//#include <mma.h>
-//#include <cublasXt.h>
 
-//TODO: COPY WEIGHTS, BIAS, TRAIN TILE AND VALIDATIONS SAMPLES TO GPU
+namespace cg = cooperative_groups;
 
-#define CUBLAS_ERROR(e); \
-    if((e)!=CUBLAS_STATUS_SUCCESS){\
-        printf("%d %d", __LINE__, e);\
-    }
+#define CHECK_CUDA_ERROR();\
+    do{\
+        auto error = cudaGetLastError(); \
+        if (error != cudaSuccess) {\
+            /* print the CUDA error message and exit*/\
+            printf("CUDA error: %s\n", cudaGetErrorString(error)); \
+        }\
+    } while (0);
+//================================================
+//==================|UTILITY|=====================
+//================================================
 
-cublasHandle_t cublas_handle;
+template<typename T>
+__device__ T exponential(T in) {
+    __builtin_unreachable();
+}
+template<> __device__ float  exponential<float>(float in) {
+    return expf(in);
+}
+template<> __device__ double exponential<double>(double in) {
+    return exp(in);
+}
+template<> __device__ half   exponential<half>(half in) {
+    return hexp(in);
+}
 
-enum Activation {RELU=0, SIGMOID=1, SOFTMAX=2};
+template<typename T>
+__device__ T logarithm(T in) {
+    __builtin_unreachable();
+}
+template<> __device__ float  logarithm<float>(float in) {
+    return logf(in);
+}
+template<> __device__ double logarithm<double>(double in) {
+    return log(in);
+}
+template<> __device__ half   logarithm<half>(half in) {
+    return hlog(in);
+}
 
-/*
-__global__ void add_bias_1(uint32_t ind) { //output[ind] += bias[ind]
-        int idx = threadIdx.x + blockIdx.x * blockDim.x;
-        int ind_bias = idx % layer_size[ind + 1];
+//========================================================
+//==================|General Purpose|=====================
+//========================================================
 
-        output[ind][idx] += bias[ind_bias];
-    }
-    __global__ void add_bias_2(uint32_t ind) { //output[ind] += bias[ind]
-        int idx = threadIdx.x + blockIdx.x * blockDim.x;
-        int ind_bias = threadIdx.x;
+enum DIVISIBILITY { UNKNOWN = -1, DIVISIBLE = 1, NOT_DIVISIBLE = 2 };
+template<typename T> struct __device_builtin__ __builtin_align__(2 * sizeof(T)) var2 { T a, b; };
+template<typename T> struct __device_builtin__ __builtin_align__(4 * sizeof(T)) var4 { T a, b, c, d; };
 
-        output[ind][idx] += bias[ind_bias];
-    }
-    __global__ void add_bias_3(uint32_t ind) { //output[ind] += bias[ind]
-        int idx = threadIdx.x + blockIdx.x * blockDim.x;
-        int ind_bias = blockIdx.x;
-
-        output[ind][idx] += bias[ind_bias];
-    }
+/*Fill out with repeting copies of in.
+@param out: pointer to memory to fill
+@param in: memory used for filling
+@param n_out: lenght of out
+@param n_in: lenght of in
+@template div: is n_out divisible by blockDim.x?
 */
+template<typename T, DIVISIBILITY div>
+__global__ void set_repeating(T* out, T* in, uint32_t n_out, uint32_t n_in) {
+    bool div_;
+    if constexpr (div == DIVISIBILITY::UNKNOWN)
+        div_ = ((n_out % blockDim.x) == 0);
 
-__global__ void add_bias(uint32_t ind) {}
-template<uint32_t i>
-void activate(uint32_t) {}
-
-template<typename T, Activation ACT> //Activation for hidden layer, outputlayer use softmax by default
-class MultiLayerPerceptron {
-private:
-    uint32_t num_layer;    //Number of layers
-    uint32_t num_neurons;  //Number of neurons excluding the input layer
-    uint32_t* layer_size;  //Number of neurons per layer
-    float learning_factor; //Learning factor
-    uint32_t batch_size;   //Number of samples per batch
-
-    T** weights;  //Pointer to 2D-Array                                               | weights[i] has dimension layer_size[i+1] x layer_size[i]
-    T** bias;     //Pointer to Array                                                  | bias[i]    has dimension layer_size[i+1] x 1 
-    T** output;   //Pointer to Array, after activation                                | output[i]  has dimension layer_size[i+1] x batch_size
-    T*  error[2]; //Memory is resused, only store error of current and last layer.    |
-
-    int fd_in, fd_out;             //File descritors of files holding dataset
-    T* train_input, train_output;  //Part of dataset for training
-    uint32_t train_samples;        //Number of samples in this part
-    T* val_input, val_output;      //Part of dataset for validation
-    uint32_t validation_samples;   //Number of samples in this part
-    uint32_t tile_size = 0;        //Number of training samples loaded into ram at once
-    
-    uint32_t* cur_in ;             //Pointer to current input data
-    uint32_t* cur_out;             //Pointer to current output data
-
-    /*  Multiplies B with weight matrix and stores in output.
-        Because cuBLAS interprets the Matrixes as if they were column major, we simply switch order of multiplication
-    */
-    template<typename TYPE>        
-    void weight_mul(uint32_t ind, TYPE* B, TYPE* alpha, TYPE* beta) {
-        static_assert(typeid(TYPE) != typeid(TYPE), "The type passed to MultiLayerPerceptron is unsupported");
-    }
-    template<> void weight_mul<float>(uint32_t ind, float* B, float* alpha, float* beta) {
-        cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, layer_size[ind+1], batch_size, layer_size[ind], alpha, weights[ind], layer_size[ind+1], B, layer_size[ind], beta, output[ind], layer_size[ind+1]);
-    }
-    template<> void weight_mul<double>(uint32_t ind, double* B, double* alpha, double* beta) {
-        cublasDgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, layer_size[ind + 1], batch_size, layer_size[ind], alpha, weights[ind], layer_size[ind + 1], B, layer_size[ind], beta, output[ind], layer_size[ind + 1]);
-    }
-    template<> void weight_mul<half>(uint32_t ind, half* B, half* alpha, half* beta) {
-        cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, layer_size[ind + 1], batch_size, layer_size[ind], alpha, weights[ind], CUDA_R_16F, layer_size[ind + 1], B, CUDA_R_16F, layer_size[ind], beta, output[ind], CUDA_R_16F, layer_size[ind + 1], CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    }
-
-public:
-    MultiLayerPerceptron(uint32_t n, uint32_t* l)
-        : num_layer(n), layer_size(l)
+    for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+        i < n_out;
+        i += blockDim.x * 2 * gridDim.x)
     {
-        //Analyse input
-        uint64_t num_weights = 0;
-                 num_neurons = 0;
-        uint32_t max_neurons = *std::max_element(layer_size, layer_size + num_layer);
-        for (uint32_t layer = 1; layer != num_layer; layer++) {
-            num_weights += layer_size[layer - 1] * layer_size[layer];
-            num_neurons += layer_size[layer];
+        out[i] = in[i % n_in];
+
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::DIVISIBLE)
+            out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::NOT_DIVISIBLE) {
+            if (i + blockDim.x < n_out)
+                out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
         }
-
-        //Allocate memory
-        uint64_t alloc_weights = num_weights;
-        uint64_t alloc_bias = num_neurons;
-        uint64_t alloc_error = max_neurons * 2;
-        T* raw_mem = (T*)malloc(sizeof(T) * (alloc_weights + alloc_bias + alloc_error));
-
-        T* weights_mem = raw_mem;
-        raw_mem += alloc_weights;
-        weights = (T**)malloc(sizeof(T*) * (num_layer - 1)); //First layer needs no weights
-        weights[0] = weights_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            weights[layer] = weights[layer - 1] + layer_size[layer - 1] * layer_size[layer];
-        }
-
-        T* bias_mem = raw_mem;
-        raw_mem += alloc_bias;
-        bias = (T**)malloc(sizeof(T*) * (num_layer-1)); //First layer needs no bias
-        bias[0] = bias_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            bias[layer] = bias[layer - 1] + layer_size[layer];
-        }
-
-        T* error_mem = raw_mem;
-        error[0] = error_mem;
-        error[1] = error_mem + max_neurons;
-
-
-        output = (T**)calloc(sizeof(T*) * (num_layer- 1)); //First layer needs no output
-
-        //Initialize memory
-#ifdef SMART_WEIGHTS
-        for (uint32_t layer = 0; layer != num_layer - 1; layer++) {
-            uint32_t layer_size = layer_size[layer] * layer_size[layer + 1];
-            double scale = sqrt(2.0 / ((double)layer_size));
-            for (uint32_t ind = 0; ind != layer_size; ind++) {
-                weights[layer][ind] = random(-scale, scale);
-            }
-        }
-#else
-        for (uint32_t i = 0; i != alloc_weights; i++) {
-            weights_mem[i] = random(-1.0, 1.0);
-        }
-#endif
-
-        for (uint32_t i = 0; i != alloc_bias; i++) {
-            bias_mem[i] = random(0.0, 1.0);
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN) {
+            if (div_ || i + blockDim.x < n_out) //Compiler will automaticly eliminate lopp-independet condition N_divisible_blocksize_
+                out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
         }
     }
-    MultiLayerPerceptron(char* file) {
-        load_parameters(file);
-    }
-    bool load_parameters(char* file) {
-        //File-stuff
-        int fd = open(file, O_RDONLY);
-        
-        std::type_info* type;                    //Actual value does not matter, only needed because std::type_info has no constructor
-        //char type_[sizeof(std::type_info)];
-        read(fd, type, sizeof(std::type_info));
-        if (*type != typeid(T))
-            return false;
+}
 
-        //Get dimensions
-        read(fd, &num_layer, sizeof(uint32_t));
-        layer_size = (uint32_t*)malloc(sizeof(uint32_t)*num_layer);
-        read(fd, layer_size, sizeof(uint32_t) * num_layer);
+//Same as above, but with constexpr n_in to eliminate slow modulo
+template<typename T, DIVISIBILITY div, uint32_t n_in>
+__global__ void set_repeating(T* out, T* in, uint32_t n_out) {
+    bool div_;
+    if constexpr (div == DIVISIBILITY::UNKNOWN)
+        div_ = ((n_out % blockDim.x) == 0);
 
-        uint64_t num_weights = 0;
-                 num_neurons = 0;
-        uint32_t max_neurons = 0;
-        for (uint32_t layer = 0; layer != num_layer; layer++) {
-            if (layer != 0) num_weights += layer_size[layer - 1] * layer_size[layer];
-            num_neurons += layer_size[layer];
-            max_neurons = std::max(max_neurons, layer_size[layer]);
-        }
-
-        //Allocate memory
-        uint64_t alloc_weights = num_weights;
-        uint64_t alloc_bias = num_neurons;
-        uint64_t alloc_error = max_neurons * 2;
-        T* raw_mem = (T*)malloc(sizeof(T) * (alloc_weights + alloc_bias + alloc_error));
-
-        T* weights_mem = raw_mem;
-        raw_mem += alloc_weights;
-        weights = (T**)malloc(sizeof(T*) * (num_layer - 1)); //First layer needs no weights
-        weights[0] = weights_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            weights[layer] = weights[layer - 1] + layer_size[layer - 1] * layer_size[layer];
-        }
-
-        T* bias_mem = raw_mem;
-        raw_mem += alloc_bias;
-        bias = (T**)malloc(sizeof(T*) * (num_layer - 1)); //First layer needs no bias
-        bias[0] = bias_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            bias[layer] = bias[layer - 1] + layer_size[layer];
-        }
-
-        T* error_mem = raw_mem;
-        error[0] = error_mem;
-        error[1] = error_mem + max_neurons;
-
-        output = (T**)calloc(sizeof(T*) * (num_layer - 1)); //First layer needs no output
-
-        //Initialize memory
-        read(fd, weights_mem, alloc_weights * sizeof(T)); //These two reads could theoretically be merged
-        read(fd, bias_mem, alloc_bias * sizeof(T));
-
-        close(fd);
-    }
-    void store_parameters(char* file) {
-        //File stuff
-        int fd = open(file, O_WRONLY);
-
-        write(fd, &(typeid(T)), sizeof(std::type_info));     //1.: Type
-        write(fd, &(num_layers), sizeof(uint32_t));          //2.: num_layers
-        write(fd, layer_size, sizeof(uint32_t) * num_layer); //3.: layer_size
-        for (int i = 0; i != num_layer - 1; i++) {           //4.: weights
-            write(fd, weights[i], sizeof(T) * layer_size[i] * layer_size[i+1]);
-        }
-        for (int i = 0; i != num_layer; i++) {               //5.: bias
-            write(fd, bias[i], sizeof(T) * layer_size[i]);
-        }
-    
-    }
-   
-    void unload_resources() {
-        close(fd_in);
-        close(fd_out);
-
-        free(train_input);
-        free(train_output);
-        free(validation_input);
-        free(validation_output);
-
-        tile_size = 0;
-    }
-    void load_resources(char* in, char* out, uint32_t train_samples_, uint32_t validation_samples_, uint32_t tile_size_)
+    for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+        i < n_out;
+        i += blockDim.x * 2 * gridDim.x)
     {
-        //Copy hyperparameters
-        train_samples = train_samples_;
-        validation_samples = validation_samples_;
-        tile_size = tile_size_;
+        out[i] = in[i % n_in];
 
-        //Open files
-        fd_in  = open(in , O_RDONLY);
-        fd_out = open(out, O_RDONLY);
-
-        //Allocate ram
-        uint64_t storage_needed = (layer_size[0] + layer_size[num_layer - 1]) * (tile_size + validation_samples);
-        T* raw_mem = (T*)malloc(sizeof(T)*storage_needed);
-
-        train_input = raw_mem;
-        raw_mem += layer_size[0] * tile_size;
-        train_output = raw_mem;
-        raw_mem += layer_size[num_layer - 1] * tile_size;
-        val_input = raw_mem;
-        raw_mem += layer_size[0] * validation_samples;
-        val_output = raw_mem;
-
-        //Copy validation samples
-        lseek(fd_in , sizeof(T) * train_samples * layer_size[0], SEEK_SET);
-        lseek(fd_out, sizeof(T) * train_samples * layer_size[num_layer - 1], SEEK_SET);
-        read(fd, val_input , sizeof(T) * validation_samples * layer_size[0]);
-        read(fd, val_output, sizeof(T) * validation_samples * layer_size[num_layer - 1]);
-
-        load_tile();
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::DIVISIBLE)
+            out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::NOT_DIVISIBLE) {
+            if (i + blockDim.x < n_out)
+                out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
+        }
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN) {
+            if (div_ || i + blockDim.x < n_out) //Compiler will automaticly eliminate lopp-independet condition N_divisible_blocksize_
+                out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
+        }
     }
-    void load_tile() { 
-        //Check for wrap around
-        auto ofs = lseek(fd_in, 0, SEEK_CUR);
-        int bytes_left = sizeof(T) * train_samples * layer_size[0] - ofs;
-        if (sizeof(T) * tile_size * layer_size[0] > bytes_left) {
-            int bytes_left_out = (bytes_left / layer_size[0]) * layer_size[num_layer - 1];
+}
 
-            read(fd_in , train_input , bytes_left);
-            read(fd_out, train_output, bytes_left_out);
-            lseek(fd_in , 0, SEEK_SET);
-            lseek(fd_out, 0, SEEK_SET);
-            read(fd_in , train_input  + (bytes_left     / sizeof(T)), sizeof(T) * tile_size * layer_size[0] - bytes_left);
-            read(fd_out, train_output + (bytes_left_out / sizeof(T)), sizeof(T) * tile_size * layer_size[num_layer - 1] - bytes_left_out);
+//Adds all elements of in[0:N] to out[0]
+template<typename T, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32>
+__global__ void reduce(T* in, T* out, uint32_t N) {
+    //0.: Compute unknown divisibilities
+    bool N_divisible_blocksize_, N_divisible_32_;
+    if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
+        N_divisible_blocksize_ = ((N % blockDim.x) == 0);
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN)
+        N_divisible_32_ = ((N % 32) == 0);
+
+    //1.: Initialize variables
+    T sum = 0;
+
+    //2.: Reduce multiple elements per thread
+    for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+        i < N;
+        i += blockDim.x * 2 * gridDim.x)
+    {
+        sum += in[i];
+
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::DIVISIBLE)
+            sum += in[i + blockDim.x];
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::NOT_DIVISIBLE) {
+            if (i + blockDim.x < N)
+                sum += in[i + blockDim.x];
+        }
+        if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN) {
+            if (N_divisible_blocksize_ || i + blockDim.x < N) //Compiler will automaticly eliminate lopp-independet condition N_divisible_blocksize_
+                sum += in[i + blockDim.x];
+        }
+    }
+    
+    //3.: Store results
+    if constexpr (N_divisible_32 == DIVISIBILITY::DIVISIBLE) {
+        for (int offset = 32 / 2; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+        if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+    }
+    if constexpr (N_divisible_32 == DIVISIBILITY::NOT_DIVISIBLE) {
+        if (((threadIdx.x + blockIdx.x * blockDim.x)&~(0b11111)) + 32 < N) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
         }
         else {
-            read(fd_in , train_input , sizeof(T) * tile_size * layer_size[0]);
-            read(fd_out, train_output, sizeof(T) * tile_size * layer_size[num_layer - 1]);
-        }
-
-    } //Loads tile starting from current file pointer offset. Increments file pointer
-
-    void set_batchSize(uint32_t batch_size_) {
-        batch_size = batch_size_;
-        assert(tile_size != 0 && tile_size % batch_size == 0);
-
-        //Free old output-arrays
-        if ((uint64_t)output[0] != 0ull)
-            free(output[0]);
-        
-        T* output_mem = (T*)malloc(sizeof(T) * num_neurons * batch_size); //First layer needs no output
-        output[0] = output_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            output[layer] = output[layer - 1] + layer_size[layer] * batch_size;
-        }
-    } //Has to be called after a dataset was loaded
-    void set_learningFactor(float f) {
-        learning_factor = f;
-    }
-
-    void train(uint32_t num_batches) {
-        T* train_in_end = train_input + tile_size * layer_size[0];
-
-        for (int batch = 0; batch != num_batches; batch++) {
-            if (cur_in == train_in_end) {
-                cur_in = train_input;
-                cur_out = train_output;
-                load_tile();
-            }
-            forward_propagate(cur_in);
-            backward_propagate(cur_out);
-
-            cur_in += batch_size * layer_size[0];
-            cur_out += batch_size * layer_size[num_layer - 1];
+            atomicAdd(out, sum);
         }
     }
-    void forward_propagate(uint32_t* in_data) {
-        //Set up constants
-        T scalars[2] = {(T)1, (T)0};
-        dim3 block_size = {1,0,0};
-        dim3 grid_size = { 1,0,0 };
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN) {
+        if (N_divisible_32_ || ((threadIdx.x + blockIdx.x * blockDim.x) & ~(0b11111)) + 32 < N) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
 
-        weight_mul<T>(0, in_data, &scalars[0], &scalars[1]);
-        add_bias<<<block_size, grid_size>>>(0);
-        activate<ACT>(0);
-        for (int l = 1; l != num_layer-1; l++) {
-            weight_mul<T>(l, output[l-1], &scalars[0], &scalars[1]);
-            add_bias<<<block_size, grid_size>>>(l);
-            activate<ACT>(l);
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
         }
-        weight_mul<T>(l, output[l - 1], &scalars[0], &scalars[1]);
-        add_bias<<<block_size, grid_size>>>(l);
-        activate<Activation::SOFTMAX>(l);
+        else {
+            atomicAdd(out, sum);
+        }
     }
-    void backward_propagate(uint32_t* ind) {}
+}
 
-    double get_error() {}
-    char* get_info() {}
-    T* get_output(uint32_t* in) {} //Has to reset batch_size
-};
+template<typename T, typename F, typename G, typename V>
+__global__ void set(T* in, uint32_t n, F f, G g) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    V var;
+    g(&var, idx);
 
-#define X 32768
-#define Y 32768
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val;
+        val.a = f(var);
+        val.b = f(var);
+        val.c = f(var);
+        val.d = f(var);
+        reinterpret_cast<var4<T>*>(in)[i] = val;
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n)
+        in[i] = f(var);
+}
 
-__global__ void add_bias_1(uint32_t* output, uint32_t* bias) { //output[ind] += bias[ind]
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+//Applys f elementwise to in[0:n]
+template<typename T, typename F>
+__global__ void transform(T* in, uint32_t n, F f) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        val.a = f(val.a);
+        val.b = f(val.b);
+        val.c = f(val.c);
+        val.d = f(val.d);
+        reinterpret_cast<var4<T>*>(in)[i] = val;
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n)
+        in[i] = f(in[i]);
+}
+
+//Same as above, but calls g at the beginning to initialize additional variable
+template<typename T, typename F, typename G, typename V>
+__global__ void transform(T* in, uint32_t n, F f, G g) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    V var;
+    g(&var, idx);
+
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        val.a = f(val.a, var);
+        val.b = f(val.b, var);
+        val.c = f(val.c, var);
+        val.d = f(val.d, var);
+        reinterpret_cast<var4<T>*>(in)[i] = val;
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n)
+        in[i] = f(in[i], var);
+}
+
+//in1[i] = f(in1[i], in2[i]); 0<=n<n
+template<typename T, typename F>
+__global__ void transform(T* in1, T* in2, uint32_t n, F f) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in1)[i];
+        var4<T> val = reinterpret_cast<var4<T>*>(in2)[i];
+        val1.a = f(val1.a, val2.a);
+        val1.b = f(val1.b, val2.b);
+        val1.c = f(val1.c, val2.c);
+        val1.d = f(val1.d, val2.d);
+        reinterpret_cast<var4<T>*>(in1)[i] = val1;
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n)
+        in1[i] = f(in1[i], in2[i]);
+}
+
+template<typename T, typename F, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32, bool write>
+__global__ void transform_reduce(T* in, T* out, uint32_t n, F f) {
+    //0.: Compute unknown divisibilities
+    bool N_divisible_blocksize_, N_divisible_32_;
+    if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
+        N_divisible_blocksize_ = ((n % blockDim.x) == 0);
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN)
+        N_divisible_32_ = ((n % 32) == 0);
+
+    //1.: Initialize variables
+    T sum = 0;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    //2.: Reduce multiple elements per thread
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        val.a = f(val.a);
+        val.b = f(val.b);
+        val.c = f(val.c);
+        val.d = f(val.d);
+        sum += (val.a + val.b) + (val.c + val.d);
+        if constexpr (write) { reinterpret_cast<var4<T>*>(in)[i] = val; }
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n) {
+        T tmp = f(in[i]);
+        sum += tmp;
+        if constexpr (write) in[i] = tmp;
+    }
+
+    //3.: Store results
+    if constexpr (N_divisible_32 == DIVISIBILITY::DIVISIBLE) {
+        for (int offset = 32 / 2; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+        if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+    }
+    if constexpr (N_divisible_32 == DIVISIBILITY::NOT_DIVISIBLE) {
+        if (((threadIdx.x + blockIdx.x * blockDim.x) & ~(0b11111)) + 32 < n) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+        }
+        else {
+            atomicAdd(out, sum);
+        }
+    }
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN) {
+        if (N_divisible_32_ || ((threadIdx.x + blockIdx.x * blockDim.x) & ~(0b11111)) + 32 < n) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+        }
+        else {
+            atomicAdd(out, sum);
+        }
+    }
+}
+
+template<typename T, typename F, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32, bool write>
+__global__ void transform_reduce(T* in1, T* in2, T* out, uint32_t n, F f) {
+    //0.: Compute unknown divisibilities
+    bool N_divisible_blocksize_, N_divisible_32_;
+    if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
+        N_divisible_blocksize_ = ((n % blockDim.x) == 0);
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN)
+        N_divisible_32_ = ((n % 32) == 0);
+
+    //1.: Initialize variables
+    T sum = 0;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    //2.: Reduce multiple elements per thread
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val1 = reinterpret_cast<var4<T>*>(in1)[i];
+        var4<T> val2 = reinterpret_cast<var4<T>*>(in2)[i];
+        val1.a = f(val1.a, val2.a);
+        val1.b = f(val1.b, val2.b);
+        val1.c = f(val1.c, val2.c);
+        val1.d = f(val1.d, val2.d);
+        sum += (val1.a + val1.b) + (val1.c + val1.d);
+        if constexpr (write) { reinterpret_cast<var4<T>*>(in1)[i] = val1; }
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n) {
+        T tmp = f(in1[i], in2[i]);
+        sum += tmp;
+        if constexpr (write) in1[i] = tmp;
+    }
+
+    //3.: Store results
+    if constexpr (N_divisible_32 == DIVISIBILITY::DIVISIBLE) {
+        for (int offset = 32 / 2; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+        if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+    }
+    if constexpr (N_divisible_32 == DIVISIBILITY::NOT_DIVISIBLE) {
+        if (((threadIdx.x + blockIdx.x * blockDim.x) & ~(0b11111)) + 32 < n) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+        }
+        else {
+            atomicAdd(out, sum);
+        }
+    }
+    if constexpr (N_divisible_32 == DIVISIBILITY::UNKNOWN) {
+        if (N_divisible_32_ || ((threadIdx.x + blockIdx.x * blockDim.x) & ~(0b11111)) + 32 < n) {
+            for (int offset = 32 / 2; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+            if ((threadIdx.x & 31) == 0) atomicAdd(out, sum);
+        }
+        else {
+            atomicAdd(out, sum);
+        }
+    }
+}
+
+template<typename T, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32>
+void reduceLauncher(T* in, T* out, uint32_t N) {
+    reduce<T, N_divisible_blocksize, N_divisible_32><<<(int)(1./((10./((double)(1<<13)) + 32./((double)N)))), 32>>>(in, out, N);
+}
+
+//A *= B (elementwise multiplication)
+template<typename T>
+void multiplyElementwise(T* A, T* B, uint32_t n, uint32_t b, uint32_t g) {
+    constexpr auto ldb = []__device__(T a, T b) { return a * b; };
+    transform<T, decltype(ldb)><<<g, b>>>(A, B, n, ldb)
+}
+
+//===============================================
+//==================|RANDOM|=====================
+//===============================================
+//All these functions generate a new curand state per thread. This is inefficient
+//however it is not feasible to store a state for every thread as this would require an unknown memory lenght
+
+/*
+    @param b: If false, use completly random values.
+*/
+template<typename T, bool b>
+void set_random(T* in, uint32_t s1, uint32_t s2 = 1) {
+    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
+
+    float mul = sqrt(2.f / s1);
+    auto ldb = [mul]__device__(curandState_t* s) { return  mul * curand_normal(s) };
+    set<T, decltype(ldb), decltype(init), curandState_t>(in, s1 * s2, ldb, init);
+}
+
+template<typename T>
+void random_noise(T* in, uint32_t n, T devi) {
+    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
+    auto ldb = [devi]__device__(T in, curandState_t* s) { return in + devi * curand_normal(s) };
+    transform<T , decltype(ldb), decltype(init), curandState_t>(in, n, ldb, init);
+}
+
+template<typename T>
+void random_dropout(T* in, uint32_t n, float prob) {
+    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
+    float rec = 1.f - prob;
+    auto ldb = [rec]__device__(T in, curandState_t* s) { return in * (uint32_t)(rec + curand_uniform(s)) }; //It makes no difference, if cast is to int or unsigned: cvt.rzi.s32.f32 and cvt.rzi.u32.f32 are generated respectivly
+    transform<T, decltype(ldb), decltype(init), curandState_t>(in, n, ldb, init);
+}
+
+//=====================================================
+//==================|HIDDEN LAYER|=====================
+//=====================================================
+
+template<typename T>
+void relu(T* in, uint32_t n, uint32_t b, uint32_t g) { //in[i] = f(in[i])
+    constexpr auto ldb = []__device__(T in) { return in > (T)0 ? in : (T)0; };
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T>
+void relu_deriv(T* in, uint32_t n, uint32_t g, uint32_t b) {//in[i] = f'(f^-1(in[i]))
+    constexpr auto ldb = []__device__(T in) { return in > (T)0 ? (T)1 : (T)0; };
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T, bool negate>
+void relu_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //out[i] *= f'(f^-1(in[i]))
+    constexpr auto ldb   = []__device__(T o, T i) { return in > (T)0 ? (T)o  : (T)0; };
+    constexpr auto ldb_n = []__device__(T o, T i) { return in > (T)0 ? (T)-o : (T)0; };
     
-    if (idx < X * Y) {
-        int ind_bias = idx % X;
-        output[idx] += bias[ind_bias];
+    if constexpr (negate)
+        transform<T, decltype(ldb  )><<<g, b>>>(out, in, n, ldb  );
+    else
+        transform<T, decltype(ldb_n)><<<g, b>>>(out, in, n, ldb_n);
+}
+
+template<typename T>
+void sigmoid(T* in, uint32_t n, uint32_t g, uint32_t b) { //Blocksize 64/384
+    constexpr auto ldb = []__device__(T in) { return (T)1 / ((T)1 + exponential<T>(in)); };
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T>
+void sigmoid_deriv(T* in, uint32_t n, uint32_t g, uint32_t b) {
+    constexpr auto ldb = []__device__(T in) { return in * ((T)1 - in); }
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T, bool negate>
+void sigmoid_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //out[i] *= f'(f^-1(in[i]))
+    constexpr auto ldb   = []__device__(T o, T i) { return o * (in * ((T)1 - in)); };
+    constexpr auto ldb_n = []__device__(T o, T i) { return o * (in * (in - (T)1)); };
+    
+    if constexpr (negate)
+        transform<T, decltype(ldb_n)><<<g, b>>>(out, in, n, ldb_n);
+    else
+        transform<T, decltype(ldb  )><<<g, b>>>(out, in, n, ldb  );
+}
+
+template<typename T>
+void softplus(T* in, uint32_t n, uint32_t g, uint32_t b) {
+    constexpr auto ldb = []__device__(T in) { return logarithm<T>((T)1 + exponential<T>(in)); };
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T>
+void softplus_deriv(T* in, uint32_t n, uint32_t g, uint32_t b) {
+    constexpr auto ldb = []__device__(T in) { T e = exponential<T>(in); return (e - (T)1) / e; };
+    transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
+}
+
+template<typename T, bool negate>
+void softplus_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //out[i] *= f'(f^-1(in[i]))
+    constexpr auto ldb   = []__device__(T o, T i) { T e = exponential<T>(i); return o * (e - (T)1) / e; };
+    constexpr auto ldb_n = []__device__(T o, T i) { T e = exponential<T>(i); return o * ((T)1 - e) / e; };
+    
+    if constexpr (negate)
+        transform<T, decltype(ldb_n)><<<g, b>>>(out, in, n, ldb_n);
+    else    
+        transform<T, decltype(ldb  )><<<g, b>>>(out, in, n, ldb  );
+}
+
+//===================================================
+//==================|LAST LAYER|=====================
+//===================================================
+template<typename T>
+void softmax(T* in, uint32_t n, uint32_t g, uint32_t b) {
+    T acc;
+    auto ldb = []__device__(T in) { return exponential<T>(in); };
+
+    transform_reduce<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, true><<<g, b>>>(in, &acc, n, ldb);
+    acc = (T)1 / acc;
+    transform<<<g, b>>>(in, n, [acc]__device__(T in) { return in * acc; });
+}
+
+template<typename T>
+T cross_entropy_loss(T* in, T* expected, uint32_t n, uint32_t g, uint32_t b) {
+    T* ret;
+    cudaMalloc(&ret, sizeof(T));
+    cudaMemset(ret, 0, sizeof(T));
+
+    auto ldb = []__device__(T o, T expec) { return expec * logarithm<float>(o); };
+    transform_reduce<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false><<<g, b>>>(in, expected, ret, n, ldb);
+    
+    T ret_;
+    cudaMemcpy(&ret_, ret, sizeof(T), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    cudaFree(ret);
+    return ret_;
+}
+
+/*
+Computes delta for every neuron in the output layer
+Assumes that all neurons were activated using softmax and that expected has a sum of one. The loss function is cross entropy
+\frac{\partial L}{\partial x_i} &= -\sum_{k=1}^n ŷ_k \frac{\partial}{\partial x_i}ln(y_k)\\
+&= -\sum_{k=1}^n \frac{ŷ_k}{y_k} \frac{\partial y_k}{\partial x_i}\\
+&= -\frac{ŷ_i}{y_i}(y_i(1-y_i))-\sum_{k\neq i} \frac{ŷ_k}{y_k}(y_k(-y_i))\\
+&= y_iŷ_i-ŷ_i + y_i\sum{k\neq i} ŷ_k\\
+&= y_iŷ_i-ŷ_i + y_i(1-ŷ_i)\\
+&= y_i - ŷ_i 
+where L is loss(cross entropy), y_i is output of neuron, x_i is before activation(softmax) and ŷ_i is the expected value
+
+@param in: Pointer to output of softmax
+@param expected: Expected output
+@param n: Number of neurons in output layer
+@param g,b: Launch parameters
+*/
+template<typename T>
+void softmax_cross_entropy_deriv(T* in, T* expected, uint32_t n, uint32_t g, uint32_t b) {
+    auto ldb = []__device__(T o, T expec) { return o - expec; };
+    transform<T, decltype(ldb)>(in, expected, n, f);
+}
+
+//==================================================
+//==================|OPTIMIZER|=====================
+//==================================================
+template<typename T>
+__global__ void sgd(T* w, T* delta, T* in, T scalar, uint32_t w_y, uint32_t w_x, uint32_t batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < w_y * w_x * batch_size) {
+        int b = idx % batch_size;
+        idx /= batch_size;
+        int y = idx % w_y;
+        int x = idx / w_y;
+
+        atomicAdd(weight[y + x * w_y], scalar * in[b * w_x + x] * delta[b * w_y + y]]));
+    } //index of weight is idx, compiler will optimize it away
+}
+
+template<typename T>
+__global__ void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < w_y * w_x * batch_size) {
+        int b = idx % batch_size;
+        idx /= batch_size;
+        int y = idx % w_y;
+        int x = idx / w_y;
+
+        T grad = in[b * w_x + x] * delta[b * w_y + y]] / batch_size;
+        T tmp1 = mom1[y + x * w_y];
+        T tmp2 = mom2[y + x * w_y];
+        tmp1 = (tmp1 * b1) + ((1 - b1) * grad); 
+        tmp2 = (tmp2 * b1) + ((1 - b1) * grad * grad);
+        mom1[y + x * w_y] = tmp1;
+        mom2[y + x * w_y] = tmp2;
+        
+        tmp1 /= (1 - pow(b1, t));
+        tmp2 /= (1 - pow(b2, t));
+
+        atomicAdd(weight[y + x * w_y], neg_lr * tmp1 / sqrt(tmp2 + e));
+    } //index of weight is idx, compiler will optimize it away
+}
+
+template<typename T>
+void sgd(T* w, T* delta, T* in, T learning_factor, uint32_t w_y, uint32_t w_x, uint32_t batch_size) {
+    uint32_t s = w_x * w_y * batch_size;
+    sgd<T><<<(s+31u)/32u , 32)>>>(w, delta, in, -learning_factor/batch_size, w_y, w_x, batch_size)
+}
+
+template<typename T>
+void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
+    uint32_t s = w_x * w_y * batch_size;
+    adam<T><<<(s+31u)/32u, 32>>>(w, delta, in, mom1, mom2, neg_lr, b1, b2, e, w_y, w_x, batch_size, t);
+}
+//=====================================================================================================
+//==========================OLD BENCHMARKS======================
+#if 0
+void BENCHMARK(float* in, float* out, uint32_t N, int b, int g, float* time, int& best_size) {
+    float t;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    gridReduce<float, DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN> << <g, b >> > (in, out, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t, start, stop);
+    CHECK_CUDA_ERROR();
+    if (t < *time) {
+        *time = t;
+        best_size = (g << 16) + b;
     }
 }
-__global__ void add_bias_2(uint32_t* output, uint32_t* bias) { //output[ind] += bias[ind]
+
+__global__ void set(float* mem, int l) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int ind_bias = threadIdx.x;
 
-    output[idx] += bias[ind_bias];
+    if (idx < l)
+        mem[idx] = 1.0;
 }
-__global__ void add_bias_3(uint32_t* output, uint32_t* bias) { //output[ind] += bias[ind]
+__global__ void inc(float* mem) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int ind_bias = blockIdx.x;
 
-    output[idx] += bias[ind_bias];
+    if (idx == 0)
+        *mem = (*mem) + 1.f;
+}
+__global__ void ex(float* i) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx == 0)
+        *i = exponential<float>(*i);
 }
 
+template<typename T> struct __device_builtin__ __builtin_align__(2 * sizeof(T)) var2 { T a, b; };
+template<typename T> struct __device_builtin__ __builtin_align__(4 * sizeof(T)) var4 { T a, b, c, d; };
 
-int main()
-{
-    CUBLAS_ERROR(cublasCreate(&cublas_handle));
-    //Logging
-    cublasSetAtomicsMode(cublas_handle, CUBLAS_ATOMICS_ALLOWED);
-    cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
+template<typename T>
+__inline__ __device__
+T multipleReduce1(T* in, T N, bool nIsPow2) {
+    T sum = 0;
 
-    //Block dimension
+    for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x; 
+        i < N; 
+        i += blockDim.x * 2 * gridDim.x)
+    {
+        sum += in[i];
 
-    //Set cuda stream
-    //set vector, matrixes (async), pointer mode
+        if (nIsPow2 || i + blockDim.x < N)
+            sum += in[i + blockDim.x];
 
-    //Maybe have to change indexing mode to start with 0 instead of 1 using #define IDX2C(i,j,ld) (((j)*(ld))+(i))
+    }
 
-   
-    uint32_t *output, *bias, *output_cpu, *bias_cpu;
-    output_cpu = (uint32_t*)malloc(X * Y * sizeof(uint32_t));
-    bias_cpu   = (uint32_t*)malloc(X *     sizeof(uint32_t));
-    cudaMalloc(&output, X * Y * sizeof(uint32_t));
-    cudaMalloc(&bias  , X *     sizeof(uint32_t));
+    return sum;
+}
 
-    for (int ind = 0; ind != X * Y; ind++)
-        output_cpu[ind] = rand();
-    for (int ind = 0; ind != X; ind++)
-        bias_cpu[ind] = rand();
+template<typename T>
+__inline__ __device__
+T multipleReduce2(T* in, T N, bool nIsPow2) {
+    //static_assert(typeid(T) == typeid(int) || typeid(T) == typeid(float) || typeid(T) == typeid(double), "Unknown reduction type");
+    
+    T sum = 0;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < N / 2; i += blockDim.x * gridDim.x) {
+        var2<T> val = reinterpret_cast<var2<T>*>(in)[i];
+        sum += val.a + val.b;
+    }
+    int i = idx + N / 2 * 2;
+    if (i < N)
+        sum += in[i];
 
-    cudaMemcpy(output, output_cpu, X * Y * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(bias  , bias_cpu  , X *     sizeof(uint32_t), cudaMemcpyHostToDevice);
+    return sum;
+}
 
-    int blockSize;      // The launch configurator returned block size 
-    int minGridSize;    // The minimum grid size needed to achieve the maximum occupancy for a full device launch 
-    int gridSize;       // The actual grid size needed, based on input size 
+template<typename T>
+__inline__ __device__
+T multipleReduce3(T* in, T N, bool nIsPow2) {
+    //static_assert(typeid(T) == typeid(int) || typeid(T) == typeid(float) || typeid(T) == typeid(double), "Unknown reduction type");
 
-    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, add_bias_1, 0, X * Y);
-    gridSize = (X*Y + blockSize - 1) / blockSize;
+    T sum = 0;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < N / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        sum += (val.a + val.b) + (val.c + val.d);
+    }
+    int i = idx + N / 4 * 4;
+    if (i < N)
+        sum += in[i];
 
-    printf("blockSize: %d %d\n", blockSize, gridSize);
-   
-    //Benchmark start here
+    return sum;
+}
+
+template<typename T, int mul_Algo>
+__inline__ __device__ T multipleReduce(T* in, T N, bool nIsPow2) {
+    if constexpr (mul_Algo == 0)
+        return multipleReduce1<T>(in, N, nIsPow2);
+    if constexpr (mul_Algo == 1) 
+        return multipleReduce2<T>(in, N, nIsPow2);
+    if constexpr (mul_Algo == 2)
+        return multipleReduce3<T>(in, N, nIsPow2);
+}
+
+template<typename T>
+__inline__ __device__
+T warpReduceSum(T val) {
+    for (int offset = 32 / 2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+template<typename T, int blockSize>
+__inline__ __device__
+T blockReduceSum0(T val) {//2 Warp reduces, Best when Blocksize is 1024
+    static __shared__ int shared[32]; // Shared mem for 32 partial sums
+    int lane = threadIdx.x & 0b11111;
+    int wid = threadIdx.x >> 5;
+
+    val = warpReduceSum(val);     // Each warp performs partial reduction
+
+    if (lane == 0) shared[wid] = val; // Write reduced value to shared memory
+
+    __syncthreads();              // Wait for all partial reductions
+
+    //read from shared memory only if that warp existed
+    val = (threadIdx.x < (blockSize >> 5)) ? shared[lane] : 0;
+
+    if (wid == 0) val = warpReduceSum(val); //Final reduce within first warp
+
+    return val;
+}
+
+template<typename T, int blockSize>
+__inline__ __device__
+T blockReduceSum1(T val, T* sdata) {//1 warp reduce + Manual reduce
+    int tid = threadIdx.x;
+
+    if constexpr(blockSize >= 1024)
+    {
+        if (tid < 512)
+            sdata[tid] = val = val + sdata[tid + 512];
+        __syncthreads();
+    }
+
+    if constexpr (blockSize >= 512)
+    {
+        if (tid < 256)
+            sdata[tid] = val = val + sdata[tid + 256];
+        __syncthreads();
+    }
+    
+    if constexpr (blockSize >= 256)
+    {
+        if (tid < 128)
+            sdata[tid] = val = val + sdata[tid + 218];
+        __syncthreads();
+    }
+    
+    if constexpr (blockSize >= 128)
+    {
+        if (tid < 64)
+            sdata[tid] = val = val + sdata[tid + 64];
+        __syncthreads();
+    }
+
+    if (tid < 32)
+    {
+        // Fetch final intermediate sum from 2nd warp
+        if constexpr (blockSize >= 64) val += sdata[tid + 32];
+        // Reduce final warp using shuffle
+        val = warpReduceSum(val);
+    }
+    return val;
+}
+
+template<typename T>
+__inline__ __device__
+void blockReduceSum2(T val, T* out) {//1 warp reduce + Atomics
+    T t = warpReduceSum(val);
+    if ((threadIdx.x & 31) == 0) atomicAdd(out, t);
+}
+
+template<typename T, int blockSize, int mul_Alg, bool atomic, int red_Algo>
+__global__ void gridReduce(T* in, T* out, uint32_t N, bool nIsPow2) {
+#ifdef __NVCC__
+#pragma push
+#pragma diag_suppress 177
+#else
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+#endif
+    __shared__ T sdata_[ 1024 * sizeof(T)];
+    T* sdata = +sdata_;
+#ifdef __NVCC__
+#pragma pop
+#else
+#pragma clang diagnostic pop
+#endif
+
+    T sum;
+    if constexpr(red_Algo == 1)                               //Setzt nIsPow2 voraus.
+        sum = multipleReduce<T, mul_Alg>(in, N, true);
+    else
+        sum = multipleReduce<T, mul_Alg>(in, N, nIsPow2);
+
+    if (threadIdx.x + blockIdx.x * blockDim.x + 32 < N) {     //Don't overflow
+        if constexpr (red_Algo == 0) {
+            sum = blockReduceSum0<T, blockSize>(sum);
+        }
+        else if constexpr (red_Algo == 1) {
+            sdata[threadIdx.x] = sum;
+            __syncthreads();
+            sum = blockReduceSum1<T, blockSize>(sum, sdata);
+        }
+        else if constexpr (red_Algo == 2) {
+            blockReduceSum2<T>(sum, out);
+            return;
+        }
+    }
+    
+    if (threadIdx.x == 0) {
+        if constexpr (atomic)
+            atomicAdd(out, sum);
+        else
+            out[blockIdx.x] = sum;
+    }
+}
+
+#define ALGO(mul_Algo, atomic, red_Algo) (((red_Algo&((1<<15)-1))<<16)^((mul_Algo&((1<<15)-1))<<1)^(atomic&0b1))
+#define TIME(mul_Algo, atomic, red_Algo, b_const);                                                 \
+    cudaEventRecord(start, 0);                                                                     \
+    gridReduce<float, b_const, mul_Algo, atomic, red_Algo><<<g, b_const>>>(mem, mem+N, N, nIsPow2);\
+    cudaDeviceSynchronize();                                                                       \
+    cudaEventRecord(stop, 0);                                                                      \
+    cudaEventSynchronize(stop);                                                                    \
+    cudaEventElapsedTime(&time, start, stop);                                                      \
+    CHECK_CUDA_ERROR();                                                                            \
+    if(!atomic)                                                                                    \
+        time += global_timing[min(g, ((N+31)/32)&(~(31)))];                                        \
+    if(time < global_timing[N]){                                                                   \
+        global_timing[N] = time;                                                                   \
+        global_blocks[N] = b_const;                                                                \
+        global_grids[N]  = (int)g;                                                                 \
+        global_algos[N]  = ALGO(mul_Algo, atomic, red_Algo);                                       \
+    }
+#define BENCH_AT_RED(b_const, at, red); \
+     TIME(0, at, red, b_const);         \
+     TIME(1, at, red, b_const);         \
+     TIME(2, at, red, b_const);
+#define BENCH_AT(b_const, at);                   \
+    BENCH_AT_RED(b_const, at, 0);                \
+    if(nIsPow2) { BENCH_AT_RED(b_const, at, 1); }\
+    BENCH_AT_RED(b_const, at, 2);
+#define BENCH(b_const); BENCH_AT(b_const, true); BENCH_AT(b_const, false);
+#define BENCH_ALL();\
+    BENCH(32);  \
+    BENCH(64);  \
+    BENCH(96);  \
+    BENCH(128); \
+    BENCH(160); \
+    BENCH(192); \
+    BENCH(224); \
+    BENCH(256); \
+    BENCH(288); \
+    BENCH(320); \
+    BENCH(352); \
+    BENCH(384); \
+    BENCH(416); \
+    BENCH(448); \
+    BENCH(480); \
+    BENCH(512); \
+    BENCH(544); \
+    BENCH(576); \
+    BENCH(608); \
+    BENCH(640); \
+    BENCH(672); \
+    BENCH(704); \
+    BENCH(736); \
+    BENCH(768); \
+    BENCH(800); \
+    BENCH(832); \
+    BENCH(864); \
+    BENCH(896); \
+    BENCH(928); \
+    BENCH(960); \
+    BENCH(992); \
+    BENCH(1024);
+void DO_BENCH(int N, uint32_t g, float* global_timing, int* global_blocks, int* global_grids, int* global_algos, float* mem) {
+    bool nIsPow2 = !(N & (N - 1));
+
     float time;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
-    dim3 bl1 = { (unsigned)blockSize, 1u, 1u };
-    dim3 gs1 = { (unsigned)gridSize, 1u, 1u };
-    cudaEventRecord(start, 0);
-    add_bias_1<<<bl1, gs1>>>(output, bias);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time, start, stop);
-    printf("Time1: %f\n", time);
-
-    dim3 bl2 = { (unsigned)X, 1u, 1u };
-    dim3 gs2 = { (unsigned)Y, 1u, 1u };
-    cudaEventRecord(start, 0);
-    add_bias_2<<<bl2, gs2>>>(output, bias);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time, start, stop);
-    printf("Time2: %f\n", time);
-
-    dim3 bl3 = { (unsigned)Y, 1u, 1u };
-    dim3 gs3 = { (unsigned)X, 1u, 1u };
-    cudaEventRecord(start, 0);
-    add_bias_3<<<bl3, gs3>>>(output, bias);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time, start, stop);
-    printf("Time3: %f\n", time);
-
-    CUBLAS_ERROR(cublasDestroy(cublas_handle));
-
-    return 0;
+    
+    BENCH_ALL();
 }
+
+#define B1(bl, m, a);\
+    gridReduceLauncher<float, bl, m, a, 0>(in, out, N, nIsPow2, gridSize);\
+    gridReduceLauncher<float, bl, m, a, 1>(in, out, N, nIsPow2, gridSize);\
+    gridReduceLauncher<float, bl, m, a, 2>(in, out, N, nIsPow2, gridSize);
+#define B2(bl, m);\
+    B1(bl, m, false);\
+    B1(bl, m, true);
+#define B3(bl);\
+    B2(bl, 0);\
+    B2(bl, 1);\
+    B2(bl, 2);
+#define B4();\
+    B3(32);  \
+    B3(64);  \
+    B3(96);  \
+    B3(128); \
+    B3(160); \
+    B3(192); \
+    B3(224); \
+    B3(256); \
+    B3(288); \
+    B3(320); \
+    B3(352); \
+    B3(384); \
+    B3(416); \
+    B3(448); \
+    B3(480); \
+    B3(512); \
+    B3(544); \
+    B3(576); \
+    B3(608); \
+    B3(640); \
+    B3(672); \
+    B3(704); \
+    B3(736); \
+    B3(768); \
+    B3(800); \
+    B3(832); \
+    B3(864); \
+    B3(896); \
+    B3(928); \
+    B3(960); \
+    B3(992); \
+    B3(1024);
+//========================================================================================
+template<typename T> struct __device_builtin__ __builtin_align__(2 * sizeof(T)) var2 { T a, b; };
+template<typename T> struct __device_builtin__ __builtin_align__(4 * sizeof(T)) var4 { T a, b, c, d; };
+template<typename T> __global__ void b1(T* in, T N, bool nIsPow2) {
+    if (nIsPow2) {
+        for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x; i < N; i += blockDim.x * 2 * gridDim.x) {
+            in[i] = exponential<T>(in[i]);
+            in[i + blockDim.x] = exponential<T>(in[i + blockDim.x]);
+
+        }
+    }
+    else {
+        for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x; i < N; i += blockDim.x * 2 * gridDim.x) {
+            in[i] = exponential<T>(in[i]);
+            if (i + blockDim.x < N) in[i + blockDim.x] = exponential<T>(in[i + blockDim.x]);
+        }
+    }
+}
+
+template<typename T> __global__ void b2(T* in, T N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < N / 2; i += blockDim.x * gridDim.x) {
+        var2<T> val = reinterpret_cast<var2<T>*>(in)[i];
+        val.a = exponential<T>(val.a);
+        val.b = exponential<T>(val.b);
+        reinterpret_cast<var2<T>*>(in)[i] = val;
+    }
+    int i = idx + N / 2 * 2;
+    if (i < N)
+        in[i] = exponential<T>(in[i]);
+}
+
+template<typename T> __global__ void b3(T* in, T N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < N / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        val.a = exponential<T>(val.a);
+        val.b = exponential<T>(val.b);
+        val.c = exponential<T>(val.c);
+        val.d = exponential<T>(val.d);
+        reinterpret_cast<var4<T>*>(in)[i] = val;
+    }
+    int i = idx + N / 4 * 4;
+    if (i < N)
+        in[i] = exponential<T>(in[i]);
+}
+
+int BENCHMARK2(float* in, float* out, uint32_t N, int b, int g) {
+    float t[3];
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, 0);
+    b1<float> << <g, b >> > (in, N, false);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[0], start, stop);
+    CHECK_CUDA_ERROR();
+
+    cudaEventRecord(start, 0);
+    b2<float> << <g, b >> > (in, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[1], start, stop);
+    CHECK_CUDA_ERROR();
+
+    cudaEventRecord(start, 0);
+    b3<float> << <g, b >> > (in, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[2], start, stop);
+    CHECK_CUDA_ERROR();
+
+    out[0] += t[0];
+    out[1] += t[1];
+    out[2] += t[2];
+
+    return t[0] < t[1] ? (t[0] < t[2] ? 0 : 2) : (t[1] < t[2] ? 1 : 2);
+}
+
+//=============================================================================================
+#define typeof decltype
+int BENCHMARK(float* in, float* out, uint32_t N, int g, int b, float* time) {
+    float t[4];
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    auto lambda1 = []__device__(float in) { return exponential<float>(in); };
+    auto lambda2 = [out]__device__(float in, int i) { return out[i] * logarithm<float>(in); };
+
+    cudaEventRecord(start, 0);
+    transform_reduce<float, typeof(lambda2), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false, 0> << <g, b >> > (in, out, N, lambda2);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[0], start, stop);
+    CHECK_CUDA_ERROR();
+
+    cudaEventRecord(start, 0);
+    transform_reduce<float, typeof(lambda2), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false, 1> << <g, b >> > (in, out, N, lambda2);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[1], start, stop);
+    CHECK_CUDA_ERROR();
+
+    cudaEventRecord(start, 0);
+    transform_reduce<float, typeof(lambda2), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false, 2> << <g, b >> > (in, out, N, lambda2);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[2], start, stop);
+    CHECK_CUDA_ERROR();
+
+    cudaEventRecord(start, 0);
+    transform<float, typeof(lambda1)> << <g, b >> > (in, N, lambda1);
+    reduce<float, DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN> << <g, b >> > (in, out, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&t[3], start, stop);
+    CHECK_CUDA_ERROR();
+
+    time[0] += t[0];
+    time[1] += t[1];
+    time[2] += t[2];
+    time[3] += t[3];
+
+    int m1 = t[0] < t[1] ? 0 : 1;
+    int m2 = t[2] < t[3] ? 2 : 3;
+    return t[m1] < t[m2] ? m1 : m2;
+}
+#endif
