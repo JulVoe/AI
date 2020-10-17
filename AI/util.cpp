@@ -1,7 +1,24 @@
+//TODO: RANDOM and IMAGE namespace algorithms are slow
+#define AI_VERSION 0u
+
+#undef min
+#undef max
+template<typename T> T max(T a, T b) { return (a > b) ? a : b; }
+template<typename T> T min(T a, T b) { return (a < b) ? a : b; }
+template<typename T> T abs(T x) { return (x >= (T)0) ? x : -x; }
+/*union {
+        float f;
+        int32_t i;
+    } b = { .f = x };
+    b.i &= ~(1 << 31);
+
+    return b.f;*/
+
 //==============================================
 //==================|Types|=====================
 //==============================================
 
+#include <cassert>
 #include <typeinfo>
 #include <inttypes.h>
 #include <cuda_fp16.h>
@@ -18,7 +35,27 @@ template<> uint32_t type_hash<half    >() { return 4; }
 template<> uint32_t type_hash<float   >() { return 5; }
 template<> uint32_t type_hash<double  >() { return 6; }
 
-#define AI_VERSION 0u
+uint16_t sizeOfType(uint32_t typeId) {
+    switch (typeId) {
+    case 0:
+        return sizeof(uint16_t);
+    case 1:
+        return sizeof(uint32_t);
+    case 2:
+        return sizeof(int16_t);
+    case 3:
+        return sizeof(int32_t);
+    case 4:
+        return sizeof(half);
+    case 5:
+        return sizeof(float);
+    case 6:
+        return sizeof(double);
+    default:
+        assert(0 == 1);
+        __builtin_unreachable();
+    }
+}
 
 //===============================================
 //==================|RANDOM|=====================
@@ -31,6 +68,28 @@ namespace Random {
         __m256i part1;
         __m256i part2;
     } random_key;
+
+    //--------------------|Normal Distribution|-------------------
+    //TODO: FAST-NORM
+    std::default_random_engine __gen__;
+    std::normal_distribution<float> __normal_distr__(0.f, 1.f);
+    std::uniform_int_distribution<uint32_t> __uniform_distr__(0u, (uint32_t)-1);
+
+    uint32_t rand_uint(uint32_t m) { //Output in ]0,m]
+        return __uniform_distr__(__gen__);
+    }
+
+    float rand_float(float m) { //Output in ]0,m]
+        return __gen__() * (m / (float)__gen__.max());
+    }
+
+    bool rand_prob(float prob) {
+        return __gen__() < prob * (float)__gen__.max();
+    }
+
+    float rand_normal(float dev) {
+        return __normal_distr__(__gen__) * dev;
+    }
 
     /* used by xorshift128plus_jump_onkeys */
     static void xorshift128plus_onkeys(uint64_t* ps0, uint64_t* ps1) {
@@ -72,6 +131,7 @@ namespace Random {
 
     /* Return a 256-bit random "number" */
     __m256i avx_xorshift128plus(Key& key) {
+#if 1
         __m256i s1 = key.part1;
         const __m256i s0 = key.part2;
         key.part1 = key.part2;
@@ -80,27 +140,12 @@ namespace Random {
             _mm256_xor_si256(_mm256_xor_si256(s1, s0),
                 _mm256_srli_epi64(s1, 18)), _mm256_srli_epi64(s0, 5));
         return _mm256_add_epi64(key.part2, s0);
-    }
-
-    //--------------------|Normal Distribution|-------------------
-    //TODO: FAST-NORM
-    std::default_random_engine __gen__;
-    std::normal_distribution<float> __normal_distr__(0.f, 1.f);
-    
-    uint32_t rand_uint(uint32_t m) { //Output in ]0,m]
-        return __gen__() * ((float)m / (float)(__gen__.max() + 1));
-    }
-
-    float rand_float(float m) { //Output in ]0,m]
-        return __gen__() * (m / (float)__gen__.max());
-    }
-
-    bool rand_prob(float prob) {
-        return __gen__() < prob * __gen__.max();
-    }
-
-    float rand_normal(float dev) {
-        return __normal_distr__(__gen__) * dev;
+#else
+        uint32_t arr[8];
+        for (uint32_t u = 0; u != 8; u++)
+            arr[u] = rand_uint((uint32_t)-1);
+        return _mm256_loadu_si256((__m256i*)(+arr));
+#endif
     }
     
     //------------------------------------------------------------
@@ -116,8 +161,9 @@ namespace Random {
 
 #include <inttypes.h>
 #include <assert.h>
-#define cimg_use_jpeg
-#define cimg_use_png
+#include <type_traits>
+#define cimg_use_jpeg 1
+#define cimg_use_png 1
 #include "CImg.h"
 
 using namespace cimg_library;
@@ -133,6 +179,10 @@ struct Offset2D {
         x = x_;
         y = y_;
     }
+
+    template<typename Ty> Offset2D<Ty> convert() {
+        return Offset2D<Ty>(x, y);
+    }
   
     template<typename Ty>
     void operator*=(Offset2D<Ty> m) {
@@ -145,7 +195,7 @@ struct Offset2D {
         return off;
     }
     Offset2D<T> operator-(Offset2D<T> m) {
-        Offset2D<T> off(x - m.x, y - y.x);
+        Offset2D<T> off(x - m.x, y - m.y);
         return off;
     }
 };
@@ -194,9 +244,6 @@ struct Image_Shape {
     }
 };
 
-template<typename T> T max(T a, T b) {return (a>b)?a:b;}
-template<typename T> T min(T a, T b) {return (a<b)?a:b;}
-
 namespace Image {
 /*
   It makes more sense to store Images channel-first as for cnn's channels are seen in a more general context an can be complety unrelated and are thus not stored interleaved
@@ -204,16 +251,20 @@ namespace Image {
   For saturation and brightness, all channels of a pixel are needed and thus a interleaved storage is more cache-coherent. 
 */
     //DO NOT CHANGE ANY OF THESE VALUES OR TYPES!
-    enum CHANNEL_ORDER : int8_t {CHANNELS_FIRST = 0, CHANNELS_LAST = 1};
-    enum CHANNELS : uint16_t {RGB = 3, GRAY = 1};
-    enum PADDING : uint8_t {ZERO_PADDING_NORMAL = 0, ZERO_PADDING_RENORMALIZE = 1, EXTENSION = 2};
-    enum DISTRIBUTION : uint8_t {UNIFORM = 0, NORMALIZED = 1};
+    enum CHANNEL_ORDER : int8_t   {CHANNELS_FIRST = 0, CHANNELS_LAST = 1};
+    enum CHANNELS      : uint16_t {RGB = 3, GRAY = 1};
+    enum PADDING       : uint8_t  {ZERO_PADDING_NORMAL = 0, ZERO_PADDING_RENORMALIZE = 1, EXTENSION = 2};
+    enum DISTRIBUTION  : uint8_t  {UNIFORM = 0, NORMALIZED = 1};
     struct DATA_FORMAT {
         DISTRIBUTION distribution;
         float range; //If normalized, this is standard deviation and thus has to be >0. If uniform, this is maximum. Minimum is 0 if >0 and else -maximum
 
-        DATA_FORMAT(DISTRIBUTION d, int32_t r)
+        DATA_FORMAT(DISTRIBUTION d, float r)
           :distribution(d), range(r)
+        {}
+
+        DATA_FORMAT(const DATA_FORMAT& d)
+            :distribution(d.distribution), range(d.range)
         {}
 
         bool operator==(DATA_FORMAT f){
@@ -304,8 +355,10 @@ namespace Image {
             }
         }
     }
-  
-    //Return pixel array and its shape for an image specified using its path. CHANNEL_ORDER and CHANNELS can be specified.
+
+    /*
+        Return pixel array and its shape for an image specified using its path. CHANNEL_ORDER and CHANNELS can be specified.
+    */
     template<typename T, CHANNEL_ORDER o = CHANNEL_ORDER::CHANNELS_FIRST, CHANNELS channels = CHANNELS::RGB, DISTRIBUTION distr = DISTRIBUTION::UNIFORM, int32_t range = 256>
     void getPixels(char* path, T*& dat, Image_Shape& shape) {
         //1.: Open image
@@ -331,7 +384,7 @@ namespace Image {
         //4.: Convert to  the right CHANNEL_ORDER
         if constexpr (o == CHANNEL_ORDER::CHANNELS_LAST)
             img.permute_axes("cxyz");
-                       
+
         //5.: Store data (img will be deconstructed, save the data)
         dat = (T*)malloc(5 * sizeof(T) * shape.x * shape.y * shape.z);
         memcpy(dat, img.data(), sizeof(T) * shape.x * shape.y * shape.z);
@@ -340,33 +393,60 @@ namespace Image {
         if constexpr(distr != DISTRIBUTION::UNIFORM || range != 256) {
             DATA_FORMAT old_format{DISTRIBUTION::UNIFORM, 256};
             DATA_FORMAT new_format{distr, range};
-            remap_format<T, o>(dat, shape, old_format, new_format);
+            remap_format<T>(dat, shape, old_format, new_format, o);
         }
     }
 
-    template<typename T, CHANNEL_ORDER o = CHANNEL_ORDER::CHANNELS_FIRST>
-    void show(T* dat, Image_Shape shape){
+    /*
+        Displays an image above black background
+
+        @param T: The type of the image data
+        @param renormalize: Whether to renormalize the image data
+        @param dat: The image data
+        @param shape: The shape of the image to display
+        @param o: Channel order of the data
+    */
+    template<typename T, bool renormalize = false>
+    void show(T* dat, Image_Shape shape, CHANNEL_ORDER o = CHANNEL_ORDER::CHANNELS_FIRST){
+        assert(shape.z <= 4);
+
         CImg<T> img(dat, shape.x, shape.y, 1, shape.z);
 
-        if constexpr(o == CHANNEL_ORDER::CHANNELS_LAST) {
+        if (o == CHANNEL_ORDER::CHANNELS_LAST) {
             img = CImg<T>(dat, shape.z, shape.x, shape.y, 1);
             img.permute_axes("yzcx");
         } else {
             img = CImg<T>(dat, shape.x, shape.y, 1, shape.z);
         }
 
-        CImgDisplay disp(img, "", 0);
+        if (shape.z == 4) {
+            static_assert(std::is_same<T, uint8_t>::value, "[Error] Currently, only uint8_t RGBA-Images can be displayed");
+            constexpr uint8_t background_color = 0;                                                            //Black backgound color
+            CImg<T> render(shape.x, shape.y, 1, 3, background_color);
+            render.draw_image(0, 0, 0, 0, img, img.get_channel(3), 1, 255);
+            
 
-        //while(!disp.is_closed()) {}
-        getchar();
+            CImgDisplay disp(render, "", renormalize);
+            disp.move(0, 0);
+
+            //while(!disp.is_closed()) {}
+            getchar();
+        }
+        else {
+            CImgDisplay disp(img, "", renormalize);
+            disp.move(0, 0);
+
+            //while(!disp.is_closed()) {}
+            getchar();
+        }
 
         if constexpr(0 == CHANNEL_ORDER::CHANNELS_LAST)
             img.permute_axes("yzcx");
 
     }
 
-  template<typename T, PADDING padding = PADDING::ZERO_PADDING_RENORMALIZE, CHANNEL_ORDER order = CHANNEL_ORDER::CHANNELS_FIRST>
-    void boxblur(T* dat, Image_Shape shape, uint32_t w, uint32_t h) {
+    template<typename T, PADDING padding = PADDING::ZERO_PADDING_RENORMALIZE>
+    void boxblur(T* dat, Image_Shape shape, uint32_t w, uint32_t h, CHANNEL_ORDER order = CHANNEL_ORDER::CHANNELS_FIRST) {
       //0.: Check parameters
       assert(w % 2 == 1 && h % 2 == 1 && w >= 3 && h >= 3);           //Width and height have to be odd, so the sliding windows has an whole number as radius. 1 makes no sense
       assert(shape.x >= w && shape.y >= h);                           //Image should be bigger than filter radius
@@ -377,7 +457,7 @@ namespace Image {
       T* buf = (T*)malloc(sizeof(T) * (1 + max(r_w, r_h)));          //Stores last r_w or r_h original image values (for each channel) to subtract from the end of the sliding window when it passes
 
       uint32_t mul;
-      if constexpr(order == CHANNEL_ORDER::CHANNELS_FIRST)
+      if (order == CHANNEL_ORDER::CHANNELS_FIRST)
           mul = 1;
       else
           mul = shape.z;
@@ -387,7 +467,7 @@ namespace Image {
           float norm = 1.f / (float)(2 * r_w + 1);
           for(uint32_t line = 0; line != shape.y; line++) {
               uint32_t cur_ind;                  //Index of currently modified component
-              if constexpr(order == CHANNELS_FIRST)
+              if (order == CHANNELS_FIRST)
                   cur_ind = line * shape.x + chn * shape.x * shape.y;
               else
                   cur_ind = line * shape.x * shape.z + chn;
@@ -450,10 +530,10 @@ namespace Image {
           norm = 1.f / (float)(2 * r_h + 1);
           for(uint32_t col = 0; col !=  shape.x; col++) {
               uint32_t cur_ind;
-              if constexpr(order == CHANNEL_ORDER::CHANNELS_FIRST)
+              if (order == CHANNEL_ORDER::CHANNELS_FIRST)
                   cur_ind = col + chn * shape.x * shape.y;
               else
-                cur_ind = col * shape.z + chn; 
+                  cur_ind = col * shape.z + chn; 
               uint32_t li      = 0;                                            //Left index. Not of image, but of buf
               uint32_t ri      = cur_ind + r_h * shape.x * mul;                //Right index
               T firstValue     = dat[cur_ind];                                 //Extends first value over the edge of the image
@@ -525,9 +605,9 @@ namespace Image {
         
         for (uint32_t i = 0; i != n; i++) {
             if (i < m)
-                boxblur<T, padding, order>(dat, shape, wl, wl);
+                boxblur<T, padding>(dat, shape, wl, wl, order);
             else
-                boxblur<T, padding, order>(dat, shape, wu, wu);
+                boxblur<T, padding>(dat, shape, wu, wu, order);
         }
     }
 
@@ -569,8 +649,8 @@ namespace Image {
         }
     }
 
-  template<typename T>
-  void random_dropout(T* dat, Image_Shape shape, float prob, CHANNEL_ORDER order = CHANNEL_ORDER::CHANNELS_FIRST) {
+    template<typename T>
+    void random_dropout(T* dat, Image_Shape shape, float prob, CHANNEL_ORDER order = CHANNEL_ORDER::CHANNELS_FIRST) {
         uint32_t m1, m2;
         if(order == CHANNEL_ORDER::CHANNELS_LAST){
             m1 = 1;
@@ -730,6 +810,8 @@ namespace Image {
     void resize(T* dat, Image_Shape old_shape, Offset2D<uint32_t> new_size, PADDING padding = PADDING::ZERO_PADDING_RENORMALIZE) {
         assert((old_shape.x <= new_size.x && old_shape.y <= new_size.y) || (old_shape.x >= new_size.x && old_shape.y >= new_size.y));
 
+        //printf("\n%p %u %u %u %u %u %u\n", dat, old_shape.x, old_shape.y, old_shape.z, new_size.x, new_size.y, (unsigned)padding);
+
         uint32_t m1_i, m2_i, m1_o, m2_o;
         if constexpr(order_in == CHANNEL_ORDER::CHANNELS_LAST){
             m1_i = 1;
@@ -787,7 +869,7 @@ namespace Image {
               break;                                                                   \
           }                                                                            \
       }                                                                                \
-      T newVal = frac_x2*frac_y2*(*in1)+frac_x1*frac_y2*(*in2)+frac_x2*frac_y1*(*in3)+frac_x1*frac_y1*(*in4); \
+      T newVal = frac_x2*frac_y2*(float)(*in1)+frac_x1*frac_y2*(float)(*in2)+frac_x2*frac_y1*(float)(*in3)+frac_x1*frac_y1*(float)(*in4); \
       dat[channel * m1_o + (y * new_size.x + x) * m2_o] = newVal;
 
 //Real code starts here
@@ -805,7 +887,7 @@ namespace Image {
                 for(int32_t y = new_size.y - 1; y >= 0; y--){
                     __resize__INTERNAL1();
                     for(int32_t x = new_size.x - 1; x >= 0; x--) {
-                      __resize__INTERNAL2();
+                        __resize__INTERNAL2();
                     }
                 }
             }
@@ -823,6 +905,113 @@ namespace Image {
           dat[ind] += factor / shape.z;
         }
     }
+
+
+    /*
+        Converts float channel first images to uint8_t channel last images
+    */
+    template<typename T>
+    void shrinkToGL(T* dat, Image_Shape shape, uint8_t* out) {
+        //0.: Check paramters
+        assert(shape.z == 3);
+
+#define NEW_IND(x,y,c) (*(out + 3 * x + c + y * (3 * shape.x)))
+#define OLD_IND(x,y,c) (*(dat + x + y * shape.x + c * shape.x * shape.y))
+        for (uint32_t y = 0; y != shape.y; y++) {
+            for (uint32_t x = 0; x != shape.x; x++) {
+                NEW_IND(x, y, 0) = OLD_IND(x, y, 0) * 256.f;
+                NEW_IND(x, y, 1) = OLD_IND(x, y, 1) * 256.f;
+                NEW_IND(x, y, 2) = OLD_IND(x, y, 2) * 256.f;
+            }
+        }
+    }
+
+    /*
+        Converts single channel to 3 channels
+
+        @param in:  Input  data. Has to be lenght   len
+        @param out: Output data. Has to be lenght 3*len
+        @param len: Number of elements of type T that "in" holds
+    */
+    template<typename T, CHANNEL_ORDER ord>
+    void grayToRGB(T* in, T* out, uint32_t len) {
+        if constexpr (ord == CHANNEL_ORDER::CHANNELS_FIRST) {
+            T* i  = in;
+            T* o  = out;
+            T* o1 = o  + len;
+            T* o2 = o1 + len;
+            T* o3 = o2 + len;
+
+            while (o != o1) {
+                *o++ = *i++;
+            }
+            i = in;
+            while (o != o2) {
+                *o++ = *i++;
+            }
+            i = in;
+            while (o != o3) {
+                *o++ = *i++;
+            }
+        }
+        else {
+            T* o   = out;
+            T* i   = in;
+            T* end = i + len;
+            while (i != end) {
+                *o++ = *i;
+                *o++ = *i;
+                *o++ = *i;
+                i++;
+            }
+        }
+    }
+
+    /*
+        Sets each red value to r, each green value to g and each blue value to b. Uses input data as alph channel
+
+        @param in:  Input  data. Has to be lenght   len. Gets copied to alpha channel
+        @param out: Output data. Has to be lenght 4*len
+        @param len: Number of elements of type T that "in" holds
+        @param r: Red   channel gets set to this value
+        @param g: Green channel gets set to this value
+        @param b: Blue  channel gets set to this value
+    */
+    template<typename T, CHANNEL_ORDER ord> //TODO: Not working ccording to "show"
+    void grayToRGBA(T* in, T* out, uint32_t len, T r, T g, T b) {
+        if constexpr (ord == CHANNEL_ORDER::CHANNELS_FIRST) {
+            T* i = in;
+            T* o = out;
+            T* o1 = o + len;
+            T* o2 = o1 + len;
+            T* o3 = o2 + len;
+            T* o4 = o3 + len;
+
+            while (o != o1) {
+                *o++ = r;
+            }
+            while (o != o2) {
+                *o++ = g;
+            }
+            while (o != o3) {
+                *o++ = b;
+            }
+            while (o != o4) {
+                *o++ = *i++;
+            }
+        }
+        else {
+            T* o = out;
+            T* i = in;
+            T* end = i + len;
+            while (i != end) {
+                *o++ = r;
+                *o++ = g;
+                *o++ = b;
+                *o++ = *i++;
+            }
+        }
+    }
 }
 
 //============================================
@@ -832,9 +1021,6 @@ namespace Image {
 #include <string>
 #include <vector>
 #include <cstdio>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 namespace CSV {
     template<typename T>
@@ -851,27 +1037,49 @@ namespace CSV {
     template<> double   destringify<double  >(std::string in){ return std::stod(in); }
   
   
-    template<typename T>
-    T* loadCSV(char* path, char delim, uint32_t& n){
-        //Read file into ram
-        int fid  = open(path, O_RDONLY);
-        struct stat st;
-        fstat(fid, &st);
-        char* mem = (char*)malloc(st.st_size);
+    /*
+        Loads a file of comma-seperated values.
 
-        std::vector<T> out;
-        for(char *sta=mem, *sto=mem; sto != mem + st.st_size; sto++){
-            if(*sto == delim){ //Region sta->sto contains new element
+        Values are seperated either by delim or a newline. A newline is only allowed to occur after a delimiter.
+        After the last value, no delimiter of newline shall be used. Each line has to have the same number of values.
+
+        @param T: Type of values
+        @param path: Path to file
+        @param delim: Delimiter
+        @param size: Output. Number of lines and number of elements per line.
+    */
+    template<typename T>
+    T* loadCSV(const char* path, Offset2D<uint32_t>& size, char delim = ','){
+        //Read file into ram
+        FILE* fid  = fopen(path, "r");
+        fseek(fid, 0, SEEK_END);
+        uint32_t num_bytes = ftell(fid);
+        rewind(fid);
+        char* mem = (char*)malloc(num_bytes);
+        fread(mem, sizeof(char), num_bytes, fid);
+
+        uint32_t num_elements = 0;
+        uint32_t line_counter = 0;
+
+        T* out = (T*)malloc(sizeof(T)* ((num_bytes+1) >> 1));             //At most half of the characters are individual numbers
+        for(char *sta=mem, *sto=mem; sto <= mem + num_bytes; sto++){
+            if (*sto == '\n') {
+                line_counter++;
+                sta++;
+                assert(sta == sto);                                       //Newline only right after delimiter
+            }
+            else if(*sto == delim || sto == mem + num_bytes){             //Region sta->sto contains new element
                 std::string el_str = std::string(sta, sto);
-                out.push_back(destringify<T>(el_str));
+                out[num_elements++] = destringify<T>(el_str);
 
                 sta = sto + 1;
-                n++;
             }
         }
+        line_counter++;                                                   //Also count last line
 
-        n = out.size();
-        return out.data();
+        assert(num_elements % line_counter == 0);                         //Each line has same ammount of numbers
+        size = Offset2D<uint32_t>(num_elements / line_counter, line_counter);
+        return out;
     }
 
     template<typename T_in, typename T_out, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST>
@@ -893,21 +1101,20 @@ namespace CSV {
               out[channel * m1 + ind * m2] = (T_out)(channel == val);
             }
         }
+
+        return out;
     }
 }
 
 //===========================================================
 //==================|DATASET GENERATING|=====================
 //===========================================================
-#define EXPERIMENTAL_FILESYSTEM
+//#define EXPERIMENTAL_FILESYSTEM
 
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 #ifdef EXPERIMENTAL_FILESYSTEM
 #include <experimental/filesystem>
@@ -917,19 +1124,44 @@ namespace CSV {
 #define __FILESYSTEM__ std::filesystem
 #endif
 
-#ifndef static_warning
-#warning static_warning was not defined
-#define static_warning(a,b)
-#endif
+/*
+    Each Dataset must start with a header. It consist of (in this order)
+     - A 6 byte signature ("JVDATA")
+     - 2 bytes that store the library version that was used to generate the dataset
+     - 2 bytes that store the lenght of the entire header
+     - An arbitrary amount of header data (as long as the lenght stored in the previous 2 bytes is right). This comes in the form of a HEADER_V* object
+
+     After that, the data follows.
+
+     When a dataset is parsed, the whole header is converted into a HEADER object. Depending on which version of the library was used to generate the Dataset,
+     a different HEADER_V* class might have been used. They might have to get parsed differently into a HEADER object. 
+
+     This enables the Dataset-files to store more data in its header through using a bigger HEADER_V* class, as long a new method to parse this class into
+     an HEADER object is implemented. The HEADER class itself is not subject to change.
+*/
 
 struct HEADER{
     uint32_t type;                //Type of data
-    uint32_t x;                   //Width per sample
+    uint32_t x;                   //Width  per sample
     uint32_t y;                   //Height per sample
-    uint32_t z;                   //Depth per sample
+    uint32_t z;                   //Depth  per sample
     Image::CHANNEL_ORDER order;   //Channel order
     Image::DATA_FORMAT format;    //Format of data
     uint32_t bytes;               //Offset until real data starts
+
+    HEADER(uint32_t type_,
+           uint32_t x_,
+           uint32_t y_,
+           uint32_t z_,
+           Image::CHANNEL_ORDER order_,
+           Image::DATA_FORMAT format_,
+           uint32_t bytes_)
+        :type(type_), x(x_), y(y_), z(z_), order(order_), format(format_), bytes(bytes_)
+    {}
+
+    HEADER(const HEADER& h)
+        :type(h.type), x(h.x), y(h.y), z(h.z), order(h.order), format(h.format), bytes(h.bytes)
+    {}
 };
 struct HEADER_V1{
     uint32_t type;                //Type of data:        uint32_t  |
@@ -942,7 +1174,7 @@ struct HEADER_V1{
   
     HEADER toHEADER(uint32_t bytes){
         Image::DATA_FORMAT format(distr, range);
-        HEADER h{type, x, y, z, order, format, bytes};
+        HEADER h(type, x, y, z, order, format, bytes);
         return h;
     }
 } __attribute__((packed));
@@ -953,7 +1185,7 @@ namespace DatasetAssemble {
     void generateDatasetFile_Image(std::string dir, std::string file_out, Offset2D<uint32_t> size) {
         static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
 
-        int fd_out = open(file_out.c_str(), O_WRONLY);
+        FILE* file = fopen(file_out.c_str(), "wb");    //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
 
         printf("[INFO] Writing header\n");
         char signature[] = {"JVDATA"};
@@ -961,92 +1193,470 @@ namespace DatasetAssemble {
         uint16_t lenght;
         Image::DATA_FORMAT format(distr, range);
         HEADER_V1 header{type_hash<T>(), size.x, size.y, channels, order, format.distribution, format.range};
-        lenght = sizeof(signature) + sizeof(version) + sizeof(version) + sizeof(lenght);
+        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
 
-        write(fd_out, +signature, sizeof(signature)); //Signature:         6*uint8_t
-        write(fd_out, &version  , sizeof(version)  ); //Version:             uint16_t
-        write(fd_out, &lenght   , sizeof(lenght)   ); //Header lenght:       uint16_t
-        write(fd_out, &header   , sizeof(header)   ); //Header data:         HEADER
+        fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
+        fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
+        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
+        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER_V*
 
         printf("[INFO] Reading in filenames\n");
-        std::vector<__FILESYSTEM__::path> paths;
+        std::vector<std::string> paths;
         for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
             if (__FILESYSTEM__::is_regular_file(entry.path())) {
-              paths.push_back(entry.path());
-
+                paths.push_back(entry.path().string());
             }
         }
         printf("[INFO] Sorting filenames\n");
-        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs.string() < rhs.string();});
+        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs < rhs;});
 
-        for(const __FILESYSTEM__::path& in_file_path : paths){
+        for(const std::string& in_file_path : paths){
             printf("[INFO] Handling file %s\n", in_file_path.c_str());
 
             //File IO
             Image_Shape shape_;
             T* dat;
 
-            Image::getPixels<T, order, channels, distr, range>(in_file_path.c_str(), dat, shape_);
-            Image::resize<T, order, order>(dat, shape_, size.getOffset2D(), Image::PADDING::ZERO_PADDING_RENORMALIZE);
-            write(fd_out, dat, sizeof(T) * size.x * size.y * channels);
-        }
+            Image::getPixels<T, order, channels, distr, range>((char*)in_file_path.c_str(), dat, shape_);
+            Image::resize<T, order, order>(dat, shape_, size, Image::PADDING::ZERO_PADDING_RENORMALIZE);
 
-        close(fd_out);
+            fwrite(dat, sizeof(T), size.x * size.y * channels, file);
+        }
+        fclose(file);
     }
     
+    /*
+        Propability for each class seperated by ","
+    */
     template<typename T, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST, Image::DISTRIBUTION distr = Image::DISTRIBUTION::UNIFORM, int32_t range = 1>
-    void generateDatasetFile_Segmentation(std::string dir, std::string file_out, Image_Shape shape, Image::DATA_FORMAT old_format) {
+    void generateDatasetFile_Classification(std::string dir, std::string file_out, uint32_t num_classes) {
         static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
 
-        int fd_out = open(file_out.c_str(), O_WRONLY);
+        FILE* file = fopen(file_out.c_str(), "wb");     //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
 
         printf("[INFO] Writing header\n");
         char signature[] = {"JVDATA"};
         uint16_t version = AI_VERSION;
         uint16_t lenght;
         Image::DATA_FORMAT format(distr, range);
-        HEADER_V1 header{type_hash<T>(), shape.x, shape.y, shape.z, order, format};
-        lenght = sizeof(signature) + sizeof(version) + sizeof(version) + sizeof(lenght);
+        HEADER_V1 header{type_hash<T>(), num_classes, 1, 1, order, format.distribution, format.range };
+        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
 
-        write(fd_out, +signature, sizeof(signature)); //Signature:         6*uint8_t
-        write(fd_out, &version  , sizeof(version)  ); //Version:             uint16_t
-        write(fd_out, &lenght   , sizeof(lenght)   ); //Header lenght:       uint16_t
-        write(fd_out, &header   , sizeof(header)   ); //Header data:         HEADER
+        fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
+        fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
+        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
+        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER
 
         printf("[INFO] Reading in filenames\n");
-        std::vector<__FILESYSTEM__::path> paths;
+        std::vector<std::string> paths;
         for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
             if (__FILESYSTEM__::is_regular_file(entry.path())) {
-              paths.push_back(entry.path());
-
+              paths.push_back(entry.path().string());
             }
         }
         printf("[INFO] Sorting filenames\n");
-        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs.string() < rhs.string();});
+        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs < rhs;});
 
-        for(const __FILESYSTEM__::path& in_file_path : paths){
+        for(const std::string& in_file_path : paths){
+            printf("[INFO] Handling file %s\n", in_file_path.c_str());
+
+            //File IO
+            Offset2D<uint32_t> size;
+            T* dat = CSV::loadCSV<T>(in_file_path.c_str(), size);
+            assert(size.x == num_classes && size.y == 1);
+            dat = CSV::vec_to_img<T, T, order>(dat, num_classes, 1);
+            
+            fwrite(dat, sizeof(T), num_classes, file);
+        }
+
+        fclose(file);
+    }
+
+    /*
+        Input file must contain the class of each pixel as a number, seperated by ",".
+    */
+    template<typename T, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST, Image::DISTRIBUTION distr = Image::DISTRIBUTION::UNIFORM, int32_t range = 1>
+    void generateDatasetFile_Segmentation(std::string dir, std::string file_out, Image_Shape shape, Image::DATA_FORMAT old_format) {
+        static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
+
+        FILE* file = fopen(file_out.c_str(), "wb");     //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
+
+        printf("[INFO] Writing header\n");
+        char signature[] = { "JVDATA" };
+        uint16_t version = AI_VERSION;
+        uint16_t lenght;
+        Image::DATA_FORMAT format(distr, range);
+        HEADER_V1 header{ type_hash<T>(), shape.x, shape.y, shape.z, order, format.distribution, format.range };
+        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
+
+        fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
+        fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
+        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
+        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER
+
+        printf("[INFO] Reading in filenames\n");
+        std::vector<std::string> paths;
+        for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
+            if (__FILESYSTEM__::is_regular_file(entry.path())) {
+                paths.push_back(entry.path().string());
+            }
+        }
+        printf("[INFO] Sorting filenames\n");
+        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs) {return lhs < rhs; });
+
+        for (const std::string& in_file_path : paths) {
             printf("[INFO] Handling file %s\n", in_file_path.c_str());
 
             //File IO
             Image::DATA_FORMAT format(distr, range);
-            
-            Offset2D<T> old_size;
-            T* dat = CSV::loadCSV<T>(in_file_path.c_str(), ',', old_size);
+
+            Offset2D<uint32_t> old_size;
+            T* dat = CSV::loadCSV<T>(in_file_path.c_str(), old_size);
             dat = CSV::vec_to_img<T, T, order>(dat, old_size.x * old_size.y, shape.z);
             Image_Shape old_shape = shape;
             old_shape.setOffset2D(old_size);
 
-            Image::resize<T, order, order>(dat, old_shape, shape.getOffset2D(), Image::PADDING::ZERO_PADDING_RENORMALIZE); 
+            Image::resize<T, order, order>(dat, old_shape, shape.getOffset2D(), Image::PADDING::ZERO_PADDING_RENORMALIZE);
             Image::remap_format<T>(dat, shape, old_format, format, order);
-            
-            write(fd_out, dat, sizeof(T) * shape.x * shape.y * shape.z);
+
+            fwrite(dat, sizeof(T), shape.x * shape.y * shape.z, file);
         }
 
-        close(fd_out);
+        fclose(file);
     }
 }
 
+
+//=======================================================
+//==================|ERROR CHECKING|=====================
+//=======================================================
+
+//C++
+#include <x86intrin.h>
+#define CONC_(x,y) x##y
+#define CONC(x,y) CONC_(x,y)
+#define BUGP(x) printf(x);fflush(stdout);
+#define PADDR(x) printf("|%p|\n",&(x));fflush(stdout);
+#define STALL(); while(true){}
+void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
+void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
+template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";assert(0==1);__builtin_unreachable();/*Unknown type*/}
+template<typename T> void PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
+template<typename T> void ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
+
+#ifndef static_warning
+#warning static_warning was not defined
+#include <cstdio>
+#define static_warning(a,b) do{if(!(a)){printf(b"\n");}}while(0);
+#endif
+
+//Cuda + Cublas
+#ifdef DEBUG
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "Cuda assertion triggered: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#define CHECK_CUDA_ERROR();\
+    do{\
+        auto error = cudaGetLastError(); \
+        if (error != cudaSuccess) {\
+            /* print the CUDA error message and exit*/\
+            printf("CUDA error: %s\n", cudaGetErrorString(error)); \
+        }\
+    } while (0);
+
+
+#define CUBLAS_ERROR(e); \
+    if((e)!=CUBLAS_STATUS_SUCCESS){\
+        printf("%d %d", __LINE__, e);\
+    }
+#else
+#define gpuErrchk(ans)
+#define CHECK_CUDA_ERROR()
+#define CUBLAS_ERROR(e)
+#endif
+
+//OpenGl
+#include <C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0\um\gl\GLU.h>
+void showGLerror()
+{
+    GLenum err;
+
+    while ((err = glGetError()) != GL_NO_ERROR)
+        fprintf(stderr, "[Error] OpenGL Error-Code: %d. This is an %s.\n", err, gluErrorString(err));
+}
+
+const char* ETB_GL_DEBUG_SOURCE_STR(GLenum source)
+{
+    static const char* sources[] = {
+      "API",   "Window System", "Shader Compiler", "Third Party", "Application",
+      "Other", "Unknown"
+    };
+
+    int str_idx =
+        min<int>(source - GL_DEBUG_SOURCE_API,
+            sizeof(sources) / sizeof(const char*));
+
+    return sources[str_idx];
+}
+
+const char* ETB_GL_DEBUG_TYPE_STR(GLenum type)
+{
+    static const char* types[] = {
+      "Error",       "Deprecated Behavior", "Undefined Behavior", "Portability",
+      "Performance", "Other",               "Unknown"
+    };
+
+    int str_idx =
+        min<int>(type - GL_DEBUG_TYPE_ERROR,
+            sizeof(types) / sizeof(const char*));
+
+    return types[str_idx];
+}
+
+const char* ETB_GL_DEBUG_SEVERITY_STR(GLenum severity)
+{
+    static const char* severities[] = {
+      "High", "Medium", "Low", "Unknown"
+    };
+
+    int str_idx =
+        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
+            sizeof(severities) / sizeof(const char*));
+
+    return severities[str_idx];
+}
+
+DWORD ETB_GL_DEBUG_SEVERITY_COLOR(GLenum severity)
+{
+    static DWORD severities[] = {
+      0xff0000ff, // High (Red)
+      0xff00ffff, // Med  (Yellow)
+      0xff00ff00, // Low  (Green)
+      0xffffffff  // ???  (White)
+    };
+
+    int col_idx =
+        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
+            sizeof(severities) / sizeof(DWORD));
+
+    return severities[col_idx];
+}
+
+#define eTB_ColorPrintf printf
+#define eTB_FlushConsole(); std::fflush(stdout);
+void ETB_GL_ERROR_CALLBACK(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, GLvoid* userParam)
+{
+    eTB_ColorPrintf(/*0xff00ffff,*/ "OpenGL Error:\n");
+    eTB_ColorPrintf(/*0xff808080,*/ "=============\n");
+    /*			 */
+    eTB_ColorPrintf(/*0xff6060ff,*/ " Object ID: ");
+    eTB_ColorPrintf(/*0xff0080ff,*/ "%d\n", id);
+    /*			 */
+    eTB_ColorPrintf(/*0xff60ff60,*/ " Severity:  ");
+    eTB_ColorPrintf(/*ETB_GL_DEBUG_SEVERITY_COLOR(severity),*/
+        "%s\n",
+        ETB_GL_DEBUG_SEVERITY_STR(severity));
+
+    eTB_ColorPrintf(/*0xffddff80,*/ " Type:      ");
+    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_TYPE_STR(type));
+    /*			 */
+    eTB_ColorPrintf(/*0xffddff80,*/ " Source:    ");
+    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_SOURCE_STR(source));
+    /*			 */
+    eTB_ColorPrintf(/*0xffff6060,*/ " Message:   ");
+    eTB_ColorPrintf(/*0xff0000ff,*/ "%s\n\n", message);
+
+    // Force the console to flush its contents before executing a breakpoint
+    eTB_FlushConsole();
+}
+
+void CheckDebugLog()
+{
+    constexpr unsigned int count = 10; // max. num. of messages that will be read from the log
+    constexpr unsigned int bufsize = 2048;
+
+    unsigned int* sources = new unsigned int[count];
+    unsigned int* types = new unsigned int[count];
+    unsigned int* ids = new unsigned int[count];
+    unsigned int* severities = new unsigned int[count];
+    int* lengths = new          int[count];
+
+    char* messageLog = new char[bufsize];
+    unsigned int retVal = glGetDebugMessageLogARB(count, bufsize, sources, types, ids, severities, lengths, messageLog);
+
+    if (retVal > 0)
+    {
+        unsigned int pos = 0;
+        for (unsigned int i = 0; i < retVal; i++)
+        {
+            printf("Source:%s\tType:%s\tID:%d\tSeverity:%s\tMessage:%s\n", ETB_GL_DEBUG_SOURCE_STR(sources[i]), ETB_GL_DEBUG_TYPE_STR(types[i]), ids[i], ETB_GL_DEBUG_SEVERITY_STR(severities[i]), &messageLog[pos]);
+            pos += lengths[i];
+        }
+    }
+
+    delete[] sources;
+    delete[] types;
+    delete[] ids;
+    delete[] severities;
+    delete[] lengths;
+    delete[] messageLog;
+}
+
+#define ALL_GL_ERRORS(); CheckDebugLog(); showGLerror();
+
+//=======================================================
+//==================|TEXT RENDERING|=====================
+//=======================================================
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+//See  https://learnopengl.com/In-Practice/Text-Rendering
+namespace TextRenderer {
+    struct Character {
+        uint32_t           TextureID;  // ID handle of the glyph texture
+        Offset2D<uint32_t> Size;       // Size of glyph
+        Offset2D<uint32_t> Bearing;    // Offset from baseline to left/top of glyph
+        uint32_t           Advance;    // Offset to advance to next glyph
+    }; 
+    Character characters[128];
+
+    /*
+        Initializes the FreeType library used to render text. This has to be called before the "RenderText" function is called!
+    */
+    void initFreeType(char* font, uint32_t size) {
+        //0.: Initialize library
+        FT_Library ft;
+        if (FT_Init_FreeType(&ft))
+        {
+            fprintf(stderr, "[ERROR] FREETYPE: Could not init FreeType Library\n");
+            return;
+        }
+
+        //1.: Load font
+        FT_Face face;
+        if (FT_New_Face(ft, font, 0, &face))
+        {
+            fprintf(stderr, "[ERROR] FREETYPE: Failed to load font\n");
+            return;
+        }
+
+        //2.: Set size
+        FT_Set_Pixel_Sizes(face, 0, size);
+
+        //3.: Generate textures
+        uint8_t* buf = nullptr;                                                //Buffer used to convert grayscale to RGB
+        uint32_t allocated = 0;                                                //Number of uint8_t that buf can hold
+
+        GLuint texture[128];
+        glGenTextures(128, +texture);
+
+        for (uint8_t c = 0; c < 128; c++)
+        {
+            //Load character glyph 
+            if (FT_Load_Char(face, c, FT_LOAD_RENDER))
+            {
+                fprintf(stderr, "[ERROR] FREETYTPE: Failed to load Glyph\n");
+                continue;
+            }
+
+            //Convert to RGB
+            uint32_t x = face->glyph->bitmap.width;
+            uint32_t y = face->glyph->bitmap.rows;
+            if (x * y * 4u > allocated) {                                      //Too little space was allocated. 
+                free(buf);                                                     //Deallocate last buffer and ...
+                buf = (uint8_t*)malloc(sizeof(uint8_t) * x * y * 4u);          //Allocate a new buffer, that is big enough
+            }
+
+            Image::grayToRGBA<uint8_t, Image::CHANNEL_ORDER::CHANNELS_LAST>(face->glyph->bitmap.buffer, buf, x * y, 255, 255, 255);
+            
+                //ARR_PRINT<uint8_t>(face->glyph->bitmap.buffer, x, y);
+                //Image::show<uint8_t, false>(face->glyph->bitmap.buffer, Image_Shape(x, y, 1u), Image::CHANNEL_ORDER::CHANNELS_LAST);
+                //Image::show<uint8_t, false>(buf                       , Image_Shape(x, y, 4u), Image::CHANNEL_ORDER::CHANNELS_LAST);
+
+            //Load into texture
+            glBindTexture(GL_TEXTURE_2D, texture[(uint32_t)c]);
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA8,
+                x,
+                y,
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                buf
+            );
+
+            // set texture options
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            // now store character for later use
+            Character character = {
+                texture[(uint32_t)c],
+                Offset2D<uint32_t>(x, y),
+                Offset2D<uint32_t>(face->glyph->bitmap_left, face->glyph->bitmap_top),
+                (uint32_t)face->glyph->advance.x
+            };
+            characters[(uint32_t)c] =  character;
+        }
+    }
+
+    /*
+        Render a text with specific scale to specific position. Does unbind GL_TEXTURE_2D and the vertex array
+
+        @param text: Pointer to the text to render
+        @param vbo: Vertex buffer of window  
+        @param x: x-Coordinate of where to render the text
+        @param y: y-Coordinate of where to render the text
+        @param scale: The scale of the text
+    */
+    void renderText(char* text, float x, float y, float scale = 1.f)
+    {
+        // iterate through all characters
+        char c;
+        while ((c = *text++) != '\0') {
+            Character ch = characters[(uint32_t)c];
+
+            //PRINT_VAR(ch.Bearing.y); BUGP("\n");
+
+            float xpos = x + ch.Bearing.x * scale;
+            float ypos = y - ch.Bearing.y * scale;
+
+            float w = ch.Size.x * scale;
+            float h = ch.Size.y * scale;
+
+            // render glyph texture over quad
+            glBindTexture(GL_TEXTURE_2D, ch.TextureID);
+            glBegin(GL_QUADS);
+            glTexCoord2f(0.f, 0.f); glVertex2f(xpos    , ypos);
+            glTexCoord2f(0.f, 1.f); glVertex2f(xpos    , ypos + h);
+            glTexCoord2f(1.f, 1.f); glVertex2f(xpos + w, ypos + h);
+            glTexCoord2f(1.f, 0.f); glVertex2f(xpos + w, ypos);
+            glEnd();
+
+            // now advance cursors for next glyph (note that advance is number of 1/64 pixels)
+            x += (ch.Advance >> 6) * scale; // bitshift by 6 to get value in pixels (2^6 = 64)
+        }
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+}
+
+
+
 #if 0
+//=============================================
+//==================|Main|=====================
+//=============================================
+
 using namespace Image;
 #define TYPE float
 #include <cstdlib>

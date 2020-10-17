@@ -5,6 +5,10 @@
 #pragma warning( disable : 4710)
 #pragma warning( disable : 5039)
 #endif
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#pragma clang diagnostic ignored "-Wunused-function"
+#endif
 
 #ifndef DEBUG
 #define NDBUG
@@ -46,55 +50,25 @@ using namespace Image;
 using namespace DatasetAssemble;
 
 //TODOS (BOTH FILES!!)
-//TODO: ADD STREAMING, MULTITHREADING AND AVX
 //TODO: Block all kernel calls
-//TODO: Check initialization (Globals)
 //TODO: CONVOLUTIONS AND TILING DESIGN
 //TODO: Unified allocator
 //TODO: TYPE HANDLING
-//TODO: Different input, output and augmentation type for Dataset
-//TODO: ADD SUPPORT FOR NON_IMAGES
-//TODO: SWITCH WORKER THREADS TO VALIDATION
 //TODO: REGULARIZATION AND NORMALIZATION
-//TODO: MEMORY MAP FILES
 
 //=========================================================
 //==================|HELPER FUNCITONS|=====================
 //=========================================================
 
-#define CUBLAS_ERROR(e); \
-    if((e)!=CUBLAS_STATUS_SUCCESS){\
-        printf("%d %d", __LINE__, e);\
-    }
-
-#define CHECK_CUDA_ERROR();\
-    do{\
-        auto error = cudaGetLastError(); \
-        if (error != cudaSuccess) {\
-            /* print the CUDA error message and exit*/\
-            printf("CUDA error: %s\n", cudaGetErrorString(error)); \
-        }\
-    } while (0);
 
 #define LAUNCH_PARAM(N) (int)(1. / ((10. / ((double)(1 << 13)) + 32. / ((double)(N))))), 32
 
-template<typename T> T min(T a, T b) { if (a < b) return a; else return b; }
-template<typename T> abs(T x) { return (x >= (T)0) ? x : -x; }
-/*union {
-        float f;
-        int32_t i;
-    } b = { .f = x };
-    b.i &= ~(1 << 31);
-
-    return b.f;*/
-template<typename T> void align_val(T& in, T al) { in /= al; in *= al; }
 
 //================================================
 //==================|GLOBALS|=====================
 //================================================
 
 cublasHandle_t cublas_handle;
-cudaStream_t   data_stream;
 
 //======================================================
 //==================|DEEP LEARNING|=====================
@@ -544,11 +518,10 @@ int main()
     //Block dimension
 
     //Set cuda stream
-    cudaStreamCreate(&data_stream);
     //set vector, matrixes (async), pointer mode
 
     //Initialize random
-    init_rand();
+    Random::init_rand();
 
 
     //Maybe have to change indexing mode to start with 0 instead of 1 using #define IDX2C(i,j,ld) (((j)*(ld))+(i))
