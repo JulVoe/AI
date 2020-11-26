@@ -33,7 +33,8 @@ Notation conventions:
 //TODO: Check launch parameters
 //TODO: Const, restrict
 //TODO: Check comments, move files
-//TODO: Put methióds in classes
+//TODO: Put methods in classes
+//TODO: CASH COHERENCE
 //=========================================================
 //==================|HELPER FUNCTIONS|=====================
 //=========================================================
@@ -220,7 +221,7 @@ protected:
 
 public:
     void setLearningRates(double* learningRates_) { learningRates = learningRates_; }
-    void setMem(T* &mem) { optBuf = mem; }
+    virtual uint64_t setMem(T*& mem); //Uses amount specified in "getMemoryRequirements" for internal memory. Increments mem by this amount and returns offset to prevoous value
     virtual void getMemoryRequirements(uint64_t& num_values, uint64_t optimizables);
     virtual void initMem();
     virtual void addNode(cudaGraph_t graph, T* mem, T* cur, T* delta, T* input, uint32_t y, uint32_t x, uint32_t batch_size, cudaGraphNode_t* node);
@@ -239,7 +240,7 @@ public:
         The deserialize method should be called from the base class. It reads the optimizer type first and afterwards invokes the "deserialize"
         method of the corresponding derived class.
     */
-    virtual Optimizer<T> deserialize(FILE* file) {
+    virtual static Optimizer<T> deserialize(FILE* file) {
         OPTIMIZER_TYPE opt_type;
         fread(&opt_type, sizeof(OPTIMIZER_TYPE), 1, file);
         switch(opt_type){
@@ -277,7 +278,7 @@ public:
         The deserialize method should be called from the base class. It reads the activation type first and afterwards invokes the "deserialize"
         method of the corresponding derived class.
     */
-    virtual Activation<T> deserialize(FILE* file) {
+    virtual static Activation<T> deserialize(FILE* file) {
         ACTIVATION_TYPE act_type;
         fread(&act_type, sizeof(ACTIVATION_TYPE), 1, file);
         switch(act_type){
@@ -327,12 +328,11 @@ public:
          - serialize
          - deserialize
     */
-
+    
     /*
         Sets the variable holding a pointer to the layer right in front of this one in the network.
-        Assumes, "compGraphArguments" has already been called on "l".
     */
-    void setLayerBefore(Layer* l){ layerBefore = l; }
+    void setLayerBefore(Layer* l) { layerBefore = l; }
     /*
         Sets the batch size used by this layer. Note, that this does not reallocate state memory.
         Thus, this called should be followed up by a call to "setMem"
@@ -352,12 +352,13 @@ public:
     virtual void getMemoryRequirement(uint64_t &state_nums, uint64_t &other_nums, uint64_t &optimizables, uint64_t &tmp, uint64_t &num_nodes);
     /*
         Sets the internal memory pointers of the layer. The passed pointers will be incremented by the memory needed by this layer as returned by getMemoryRequirements.
+        Returns the offset to the values before as two uint64_t's. ret>>64 is Δstate_mem, ret&(((0b1)<<64)-1) is Δother_mem
         The passed pointer need to be 32bit aligned.
 
         @param state_mem: Uses the in getMemoryRequirement() returned number of bytes to store its own state. Advances pointer by same amount.
         @param other_mem: Uses the in getMemoryRequirement() returned number of bytes to store other data. Advances pointer by same amount.
     */
-    virtual void setMem(uint8_t* &state_mem, uint8_t* &other_mem);
+    virtual __int128 setMem(uint8_t* &state_mem, uint8_t* &other_mem);
     /* 
         Initializes "state" and "other" memory of the size returned in getMemoryRequirements.
     */
@@ -405,7 +406,7 @@ public:
         The deserialize method should be called from the base class. It reads the layer type first and afterwards invokes the "deserialize"
         method of the corresponding derived class.
     */
-    virtual Layer<T> deserialize(FILE* file) {
+    virtual static Layer<T> deserialize(FILE* file) {
         LAYER_TYPE layer_type;
         fread(&layer_type, sizeof(LAYER_TYPE), 1, file);
         switch(layer_type){
@@ -438,13 +439,22 @@ public:
         num_nodes = 3 + 5;                                                               //3 for forwardProp, 5 for backProp
     }
 
-    void setMem(T* &state_mem, T* &other_mem) overwrite {
+    __int128 setMem(T* &state_mem, T* &other_mem) overwrite {
+        //1.: Compute return value
+        __int128 upper = state_mem - state;
+        __int128 lower = other_mem - other;
+        __int128 ret   = (upper << 64) ^ lower;
+
+        //2.: Update internal values
         state = state_mem;
-        
         other = other_mem;
 
+        //3.: Increment parameters
         state_mem += outStateShape.prod() * batch_size;
         other_mem += (uint64_t)outStateShape.prod() * (1ull + (uint64_t)layerBefore->outStateShape.prod());
+    
+        //4.: Return
+        return ret;
     }
 
     //TODO/FIXIT: MAKE WORK AND DEPENDENT ON ACTIVATION FUNCTION
@@ -524,7 +534,7 @@ public:
     }
 
     void serialize(FILE* file) overwrite {
-        LAYER_TYPE layer_type;
+        LAYER_TYPE layer_type = getLayerType();
         fwrite(&layer_type, sizeof(layer_type), 1, file);
         
         fwrite(&layer_before, sizeof(layer_before), 1, file);
@@ -535,7 +545,7 @@ public:
         fwrite(&other, sizeof(other), 1, file);
     }
 
-    Layer<T> deserialize(FILE* file) overwrite {
+    static Layer<T> deserialize(FILE* file) overwrite {
         FullyConnected_Layer<T> ret{};
         
         fread(&ret.layer_before, sizeof(ret.layer_before), 1, file);
@@ -573,9 +583,9 @@ private:
 
     Optimizer<T> opt;
 
-    T* state_mem;           //Has to be realloced when batch size changes
-    T* other_tmp_mem;       //Fixed size.
-    T* tmp_mem;             //Temporary buffer, has to be realloced when batch size changes
+    T* state_mem;           //Has to be realloced when batch size changes.
+    T* other_mem;           //Fixed size.
+    T* tmp_mem;             //Temporary buffer, has to be realloced when batch size changes.
     cudaGraphNode_t* nodes; //Graph nodes
 
 public:
@@ -599,7 +609,7 @@ public:
 
         @param save_file: Path to the Checkpoint.
     */
-    NetworkBuilder(char* save_file) {//TODO: Implement lenght checks. See comments in 9.
+    NetworkBuilder(char* save_file) {
         //1.: Open file
         FILE* file = fopen(save_file, "rb");
 
@@ -618,7 +628,6 @@ public:
         //3.: Version
         uint16_t ver;
         fread(&ver, sizeof(uint16_t), 1, file);
-        assert(ver <= AI_VERSION);
         if (ver < AI_VERSION)
             printf("[INFO] \t - File version: %u. This is an old version, since this is library version %u\n", (uint32_t)ver, AI_VERSION);
         else if (ver == AI_VERSION)
@@ -639,14 +648,14 @@ public:
         //5.: Read in this object
         //The stored pointers point to the old memory location. They are still safed, as they provide relative information.
         Layer* layers_;
-        T *state_mem_, *other_mem_;
+        T *state_mem_old, *other_mem_old;
 
         fread(&layers_   , sizeof(layers_)   , 1, file);
         fread(&num_layers, sizeof(num_layers), 1, file);
         fread(&batch_size, sizeof(batch_size), 1, file);
         opt = Optimizer<T>::deserialize(file):
-        fread(&state_mem_, sizeof(state_mem_), 1, file);
-        fread(&other_mem_, sizeof(other_mem_), 1, file);
+        fread(&state_mem_old, sizeof(state_mem_old), 1, file);
+        fread(&other_mem_old, sizeof(other_mem_old), 1, file);
         
         //6.: Read in layers
         layers = (Layer*)malloc(sizeof(Layer) * num_layers);
@@ -668,7 +677,7 @@ public:
             num_nodes    += n;
         }
 
-        opt.getMemoryRequirements(ot, op);
+        opt.getMemoryRequirements(ot, optimizables);
         other_nums += ot;
 
         uint64_t other_nums_, state_nums_;
@@ -678,26 +687,43 @@ public:
         assert(state_nums == state_nums_);
 
         //8.: Allocate memory
-        gpuErrchk(cudaMalloc(&other_tmp_mem, sizeof(T) * (other_nums + tmp)));
-        gpuErrchk(cudaMalloc(&state_mem    , sizeof(T) * (state_nums)));
+        printf("[INFO] Trying to allocate %llumb on gpu for the network...", (bytes_state + bytes_other + bytes_tmp) / (1024ull * 1024ull));
+
+        gpuErrchk(cudaMalloc(&other_mem, bytes_other));
+        gpuErrchk(cudaMalloc(&state_mem, bytes_state));
+        gpuErrchk(cudaMalloc(&  tmp_mem, bytes_tmp));
+        if (other_tmp_mem != nullptr && state_mem != nullptr && tmp_mem != nullptr)
+            printf("Success!\n");
+        else {
+            printf("Failure!\n");
+            std::exit(-1);
+        }
         nodes = (cudaGraphNode_t*)malloc(sizeof(cudaGraphNode_t) * num_nodes);
 
         //9.: Set memory of layers and optimizer
-        T* state_mem_R = state_mem;
-        T* other_mem_R = other_tmp_mem;
+        __int128 expected_off = (((__int128)(state_mem - state_mem_old)) << 64) ^ ((__int128)(other_mem - other_mem_old));
+
+        T* state_mem_ = state_mem;
+        T* other_mem_ = other_mem;
         for(uint32_t ind = 0; ind != num_layers; ind++) {
-            if(ind != 0) layer[ind].setLayerBefore(&layer[ind-1]); //Should be original pointer + layers - layers_
-            layers[ind].setMem(state_mem_R, other_mem_R);          //Should be original pointer + state_mem - state_mem_ - 
+            if(ind != 0) layer[ind].setLayerBefore(&layer[ind-1]);
+            __int128 off = layers[ind].setMem(state_mem_, other_mem_);
+
+            if (off != expected_off) {
+                fprintf(stderr, "[ERROR] The memory requirements of layer %u changed!", ind-1);
+                std::exit(-1);
+            }
         }
 
-        opt.setMem(other_mem_);                                    //Should be original pointer + state_mem - state_mem_
-        other_mem_ += optimizables;
-
-        tmp = other_mem_;                                          //Should be state_mem_ + other_nums_
+        uint64_t off = opt.setMem(other_mem_);                                    //Should be original pointer + state_mem - state_mem_
+        if (off != other_mem - other_mem_old) {
+            fprintf(stderr, "[ERROR] The memory requirements of the last layer changed!");
+            std::exit(-1);
+        }
 
         //10.: Read in memory from file
-        fread(&other_tmp_mem, sizeof(T), other_nums, file);
-        fread(&state_mem    , sizeof(T), state_nums, file);
+        fread(&other_mem, sizeof(T), other_nums, file);
+        fread(&state_mem, sizeof(T), state_nums, file);
     }
 
     /*
@@ -720,37 +746,35 @@ public:
         }
 
         //2.: Get requirements of optimizer
-        opt.getMemoryRequirement(ot, op);
+        opt.getMemoryRequirement(ot, optimizables);
         other_nums += ot;
 
         //3.: Allocation
         uint64_t bytes_state = sizeof(T) * state_nums;
-        uint64_t bytes_other = sizeof(T) * (other_nums + tmp);
-        printf("[INFO] Trying to allocate %llumb on gpu for the network...", (bytes_state + bytes_other) / (1024ull * 1024ull));
+        uint64_t bytes_other = sizeof(T) * other_nums;
+        uint64_t bytes_tmp   = sizeof(T) * tmp;
+        printf("[INFO] Trying to allocate %llumb on gpu for the network...", (bytes_state + bytes_other + bytes_tmp) / (1024ull * 1024ull));
 
-        gpuErrchk(cudaMalloc(&other_tmp_ mem, bytes_other));
-        gpuErrchk(cudaMalloc(&state_mem     , bytes_state));
-        if(other_tmp_mem != nullptr && state_mem != nullptr)
+        gpuErrchk(cudaMalloc(&other_mem, bytes_other));
+        gpuErrchk(cudaMalloc(&state_mem, bytes_state));
+        gpuErrchk(cudaMalloc(&  tmp_mem, bytes_tmp  ));
+        if(other_tmp_mem != nullptr && state_mem != nullptr && tmp_mem != nullptr)
             printf("Success!\n");
         else {
             printf("Failure!\n");
-            return;
+            std::exit(-1);
         }
 
         //4.: Set pointers of layers
         T* state_mem_ = state_mem;
-        T* other_mem_ = other_tmp_mem;
+        T* other_mem_ = other_mem;
         for(uint32_t ind = 0; ind != num_layers; ind++)
             layers[ind].setMem(state_mem_, other_mem_);
 
         //5.: Set pointer of optimizer
         opt.setMem(other_mem_);
-        other_mem_ += optimizables;
 
-        //6.: Set tmp
-        tmp = other_mem_;
-
-        //7.: Allocate memory for the graph nodes
+        //6.: Allocate memory for the graph nodes
         nodes = (cudaGraphNode_t*)malloc(sizeof(cudaGraphNode_t) * num_nodes);
     }
 
@@ -778,28 +802,24 @@ public:
 
         //2.: Reallocate
         cudaFree(state_mem);
+        cudaFree(tmp_mem);
 
-        uint64_t state_nums=0, other_nums=0, optimizables=0, tmp=0, num_nodes=0; //Accumulator
-        uint64_t s,ot,op,t,n;                                                    //Per layer
+        uint64_t state_nums=0, tmp=0; //Accumulator
+        uint64_t s,t;                 //Per layer
 
         for(uint32_t ind = 0; ind != num_layers; ind++){
             layers[ind].getMemoryRequirement(s,ot,op,t,n);
 
             state_nums   += s;
-            other_nums   += ot;
-            optimizables += op;
             tmp          += t;
-            num_nodes    += n;
         }
 
-        opt.getMemoryRequirement(ot, op);
-        other_nums += ot;  
-
-        cudaMalloc(&state_mem, sizeof(T) * state_nums);
-
+        gpuErrchk(cudaMalloc(&state_mem, sizeof(T) * state_nums));
+        gpuErrchk(cudaMalloc(&  tmp_mem, sizeof(T) * tmp));
+        
         //3.: Set new memory
         T* state_mem_ = state_mem;
-        T* other_mem_ = other_tmp_mem;
+        T* other_mem_ = other_mem;
         for(uint32_t ind = 0; ind != num_layers; ind++)
             layers[ind].setMem(state_mem_, other_mem_);
     }
@@ -827,7 +847,7 @@ public:
         fwrite(&state_mem , sizeof(state_mem) , 1, out_file);
         fwrite(&other_mem , sizeof(other_mem) , 1, out_file);
         //tmp will not be changed. It can be computed using "other_nums". Data is not stored as it is temporary and lenght could easily change during implementations
-        //Nodes will not be safed, as it is perfectly valid to change the execution graph to be more efficient.
+        //Nodes will not be safed, as it is perfectly valid to change the execution graph, e.g. to be more efficient.
             
         //3.: Layer dump
         for(uint32_t ind = 0; ind != num_layer; ind++)
@@ -847,7 +867,7 @@ public:
             num_nodes    += n;
         }
 
-        opt.getMemoryRequirement(ot, op);                                        //Requirement of optimizer
+        opt.getMemoryRequirement(ot, optimizables);                              //Requirement of optimizer
         other_nums += ot;
 
         fwrite(&other_nums, sizeof(other_nums), 1         , out_file);

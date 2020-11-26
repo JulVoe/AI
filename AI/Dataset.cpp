@@ -161,7 +161,8 @@ class DatasetHandler {
     */
 private:
     FILE* fd_in, *fd_out;                 //File descritors of files holding dataset
-    HEADER in_header, out_header;         //Header of files containing the datasets 
+    HEADER_V1 in_header, out_header;      //Header of files containing the datasets
+    uint32_t header_offset[2];            //Number of bytes for both files, until data starts
     Image_Shape sample_shape[4];          //The shape of unaugmented input/output samples in dataset ([0],[1]) and of augmented input/output samples([2], [3])
     uint32_t sample_size[4];              //How many number are contained in an input/output sample in the dataset ([0],[1]) and in augmentated samples ([2],[3])
                                               
@@ -214,8 +215,8 @@ private:
             memcpy(aug_out, &cpu_tiles[1][sample_off_out], sample_size[1] * sizeof(T));
         }                                                                                    
         else { /*Go to disk*/                                                                
-            fseek(fd_in , sizeof(T) * sample_off_in  +  in_header.bytes, SEEK_SET);   
-            fseek(fd_out, sizeof(T) * sample_off_out + out_header.bytes, SEEK_SET);           
+            fseek(fd_in , sizeof(T) * sample_off_in  + header_offset[0], SEEK_SET);   
+            fseek(fd_out, sizeof(T) * sample_off_out + header_offset[1], SEEK_SET);
             fread(aug_in , sizeof(T), sample_size[0], fd_in );
             fread(aug_out, sizeof(T), sample_size[1], fd_out);
         }
@@ -741,7 +742,7 @@ private:
     // /+================+\
     // ||Helper functions||
     // \+================+/
-    inline HEADER parseInputFile(FILE* fd, Image_Shape& shape, uint32_t& sample_size, uint32_t& num_samples){
+    inline HEADER_V1 parseInputFile(FILE* fd, Image_Shape& shape, uint32_t& sample_size, uint32_t& header_off, uint32_t& num_samples){
         //1.: Signature
         printf("[INFO] Parsing dataset file...\n");
         char sig[6];
@@ -758,26 +759,29 @@ private:
         else
             printf("[INFO] \t - File version: %u. This is the recent version\n", (uint32_t)ver);
         
-        //3.: Lenght
-        uint16_t len;
-        fread(&len, sizeof(uint16_t), 1, fd);
-
-        //3.5.: Switch according to version
+        //3.: Switch according to version
         if ( ver == 0) {
             //4.: Read in header
-            HEADER_V1* header_ = (HEADER_V1*)malloc(sizeof(HEADER_V1));
-            fread(header_, sizeof(HEADER_V1), 1, fd);
-            HEADER ret = header_->toHEADER(len);
+            HEADER_V1 ret = HEADER_V1::deserialize(fd);
 
             //5.: Set shape and sample_size
             shape = Image_Shape(ret.x, ret.y, ret.z);
-            sample_size = ret.x * ret.y * ret.z;
+            sample_size = shape.prod();
 
             //6.: Compute num_samples
+            header_off = ftell(fd);
             fseek(fd, 0, SEEK_END);
-            uint64_t num_bytes = ftell(fd) - len;
-            fseek(fd, len, SEEK_SET);
+            uint64_t num_bytes = ftell(fd) - header_off;
+            fseek(fd, header_off, SEEK_SET);
 
+            PRINT_VAR(header_off);
+            BUGP("\n");
+            PRINT_VAR(num_bytes);
+            BUGP("\n");
+            PRINT_VAR(sizeOfType(ret.type));
+            BUGP("\n");
+            PRINT_VAR(sample_size);
+            
             assert(num_bytes % (sizeOfType(ret.type) * sample_size) == 0);
             num_samples = num_bytes / (sizeOfType(ret.type) * sample_size);
 
@@ -806,8 +810,8 @@ public:
         num_workers(0u), workers(nullptr), thread_status(WORKER_STATUS::IDLE),
         ready_cpu(nullptr),
         ready_gpu(nullptr),
-         in_header(NULL, NULL, NULL, NULL, Image::CHANNEL_ORDER::CHANNELS_FIRST, DATA_FORMAT(Image::DISTRIBUTION::UNIFORM, 1), NULL), //TODO: SUCKS
-        out_header(NULL, NULL, NULL, NULL, Image::CHANNEL_ORDER::CHANNELS_FIRST, DATA_FORMAT(Image::DISTRIBUTION::UNIFORM, 1), NULL), //TODO: SUCKS
+         in_header(),
+        out_header(),
         agi_in (DATA_FORMAT(DISTRIBUTION::UNIFORM, -1.f), (uint32_t)-1, false, NULL, NULL, NULL, NULL, NULL, Offset2D<float>(-1.f, -1.f), Offset2D<int32_t>(-1, -1) ),//TODO: SUCKS
         agi_out(DATA_FORMAT(DISTRIBUTION::UNIFORM, -1.f), Offset2D<int32_t>((uint32_t)-1, (uint32_t)-1), -1.f, false )//TODO: SUCKS
     {
@@ -827,8 +831,8 @@ public:
 
         //1.: Read in file
         uint32_t samples, samples1, samples2;
-         in_header = HEADER(parseInputFile(fd_in , sample_shape[0], sample_size[0], samples1));
-        out_header = HEADER(parseInputFile(fd_out, sample_shape[1], sample_size[1], samples2));
+         in_header = HEADER_V1(parseInputFile(fd_in , sample_shape[0], sample_size[0], header_offset[0], samples1));
+        out_header = HEADER_V1(parseInputFile(fd_out, sample_shape[1], sample_size[1], header_offset[0], samples2));
         if(samples1 != samples2)
             printf("[WARN] The dataset files contain a different number of samples (%u vs %u)!\n", samples1, samples2);
         samples = min(samples1, samples2);
@@ -1311,10 +1315,10 @@ public:
 #ifdef MAIN
 using namespace DatasetAssemble;
 
-#define P_IN    "/home/julian//cuda-workspace/AI-master/Datasets/1/Raw/In"
-#define P_OUT   "/home/julian//cuda-workspace/AI-master/Datasets/1/Raw/Out"
-#define P_D_IN  "/home/julian//cuda-workspace/AI-master/Datasets/1/in.jvdata"
-#define P_D_OUT "/home/julian//cuda-workspace/AI-master/Datasets/1/out.jvdata"
+#define P_IN    "C:/Users/julia/source/repos/AI/Datasets/1/Raw/In"
+#define P_OUT   "C:/Users/julia/source/repos/AI/Datasets/1/Raw/Out"
+#define P_D_IN  "C:/Users/julia/source/repos/AI/Datasets/1/in.jvdata"
+#define P_D_OUT "C:/Users/julia/source/repos/AI/Datasets/1/out.jvdata"
 
 int main() {
     //Cuda Device options
@@ -1322,9 +1326,9 @@ int main() {
     Random::init_rand();
 
     //1.: Build a dataset
-    //Offset2D<uint32_t> size(100, 100);
-    //generateDatasetFile_Image<float>(P_IN, P_D_IN, size);
-    //generateDatasetFile_Classification<float>(P_OUT, P_D_OUT, 9);
+    Offset2D<uint32_t> size(100, 100);
+    generateDatasetFile_Image<float>(P_IN, P_D_IN, size);
+    generateDatasetFile_Classification<float>(P_OUT, P_D_OUT, 9);
 
     //2.: Build a dataset handler
     AugmentationInfo2D_IN  agi_in (DATA_FORMAT(DISTRIBUTION::UNIFORM, 1.f), 1, false, 0.f, 0.05f, 0.2f, 0.1f, 0.1f, Offset2D<float>(0.95f, 0.95f), Offset2D<int32_t>(200, 200));

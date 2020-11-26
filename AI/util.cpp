@@ -71,9 +71,9 @@ uint16_t sizeOfType(uint32_t typeId) {
 void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
 void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
 template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";assert(0==1);__builtin_unreachable();/*Unknown type*/}
-template<typename T> void PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
-template<typename T> void ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
-template<typename T> void ARR_PRINT_COLMAJ(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_*y+y_]);printf("\t");}printf("\n");}printf("----------------\n");}
+template<typename T> void  PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
+template<typename T> void  ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
+template<typename T> void  ARR_PRINT_COLMAJ(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_*y+y_]);printf("\t");}printf("\n");}printf("----------------\n");}
 
 #ifndef static_warning
 #warning static_warning was not defined
@@ -361,6 +361,7 @@ struct Offset2D {
     T x;
     T y;
 
+    //Constructors
     Offset2D() {}
   
     Offset2D(T x_, T y_){
@@ -368,23 +369,40 @@ struct Offset2D {
         y = y_;
     }
 
+    //Utility
     template<typename Ty> Offset2D<Ty> convert() {
         return Offset2D<Ty>(x, y);
     }
   
+    //Arithmetic
     template<typename Ty>
     void operator*=(Offset2D<Ty> m) {
         x *= m.x;
         y *= m.y;
     }
+
     template<typename Ty>
     Offset2D<T> operator*(Offset2D<Ty> m) {
         Offset2D<T> off( x * m.x, y * m.y);
         return off;
     }
+
     Offset2D<T> operator-(Offset2D<T> m) {
         Offset2D<T> off(x - m.x, y - m.y);
         return off;
+    }
+
+    //Serialization
+    void serialize(FILE* file) {
+        fwrite(&x, sizeof(x), 1, file);
+        fwrite(&y, sizeof(y), 1, file);
+    }
+
+    static Offset2D<T> deserialize(FILE* file) {
+        Offset2D<T> ret{};
+        fread(&ret.x, sizeof(ret.x), 1, file);
+        fread(&ret.y, sizeof(ret.y), 1, file);
+        return ret;
     }
 };
 
@@ -393,10 +411,11 @@ struct Image_Shape {
     uint32_t y;
     uint32_t z;
 
+    //Constructor
     Image_Shape() = default;
   
-    Image_Shape(uint32_t x_, uint32_t y_, uint32_t z_)
-        :x(x_), y(y_), z(z_)
+    Image_Shape(uint32_t x, uint32_t y, uint32_t z)
+        :x(x), y(y), z(z)
     {}
 
     Image_Shape(uint32_t len, float aspect, uint32_t channels) {
@@ -407,10 +426,12 @@ struct Image_Shape {
         assert(x * y * z == len);
     }
 
+    //Utility
     uint32_t prod(){
         return x * y * z;
     }
 
+    //Setter and Getter
     template<typename T = uint32_t>
     Offset2D<T> getOffset2D() {
         Offset2D<T> o{ x, y };
@@ -423,6 +444,7 @@ struct Image_Shape {
         y = off.y;
     }
 
+    //Arithmetic
     template<typename T>
     void operator*=(Offset2D<T> m) {
         x *= m.x;
@@ -433,6 +455,21 @@ struct Image_Shape {
     Offset2D<T> operator*(Offset2D<T> m) {
         Offset2D<uint32_t> o{ x * m.x, y * m.y };
         return o;
+    }
+
+    //Serialization
+    void serialize(FILE* file) {
+        fwrite(&x, sizeof(x), 1, file);
+        fwrite(&y, sizeof(y), 1, file);
+        fwrite(&z, sizeof(z), 1, file);
+    }
+
+    static Image_Shape deserialize(FILE* file) {
+        Image_Shape ret{};
+        fread(&ret.x, sizeof(ret.x), 1, file);
+        fread(&ret.y, sizeof(ret.y), 1, file);
+        fread(&ret.z, sizeof(ret.z), 1, file);
+        return ret;
     }
 };
 
@@ -451,21 +488,38 @@ namespace Image {
         DISTRIBUTION distribution;
         float range; //If normalized, this is standard deviation and thus has to be >0. If uniform, this is maximum. Minimum is 0 if >0 and else -maximum
 
+        //Constructor
+        DATA_FORMAT() = default;
+
         DATA_FORMAT(DISTRIBUTION d, float r)
-          :distribution(d), range(r)
+            :distribution(d), range(r)
         {}
 
         DATA_FORMAT(const DATA_FORMAT& d)
             :distribution(d.distribution), range(d.range)
         {}
 
-        bool operator==(DATA_FORMAT f){
+        //Comparison
+        bool operator==(DATA_FORMAT f) {
             return f.distribution == distribution && f.range == range;
         }
-        bool operator!=(DATA_FORMAT f){
-            return !(f.distribution == distribution && f.range == range);
+        bool operator!=(DATA_FORMAT f) {
+            return !operator==(f);
         }
-    } __attribute__((packed));
+
+        //Serialization
+        void serialize(FILE* file) {
+            fwrite(&distribution, sizeof(distribution), 1, file);
+            fwrite(&range       , sizeof(range)       , 1, file);
+        }
+
+        static DATA_FORMAT deserialize(FILE* file) {
+            DATA_FORMAT ret{};
+            fread(&ret.distribution, sizeof(distribution), 1, file);
+            fread(&ret.range       , sizeof(range)       , 1, file);
+            return ret;
+        }
+    };
 
     template<typename T>
     void remap_format(T* dat, Image_Shape shape, DATA_FORMAT old_format, DATA_FORMAT new_format, CHANNEL_ORDER order = CHANNEL_ORDER::CHANNELS_FIRST){
@@ -520,7 +574,8 @@ namespace Image {
                     *p = (*p - shift[channel]) * mul[channel];
                 }
             }
-        } else {
+        } 
+        else {
             float mul, shift; // (in-shift)*mul
             if(old_format.distribution == DISTRIBUTION::UNIFORM && new_format.distribution == DISTRIBUTION::UNIFORM){
                 mul = (new_format.range * ((new_format.range < 0.f) ? 2.f : 1.f)) / (old_format.range * ((old_format.range < 0.f) ? 2.f: 1.f));
@@ -965,8 +1020,9 @@ namespace Image {
         }
     }
 
+    //TODO: not inplemented
     template<typename T>
-    void rotate(T* dat, Image_Shape shape, float deg) { //TODO: not inplemented
+    void rotate(T* dat, Image_Shape shape, float deg) {
         assert(0 == 1);
     }
 
@@ -1089,7 +1145,7 @@ namespace Image {
     }
 
     //Note: Do not use this, when using knowledge distilation via teacher-student networks.
-    //This may make temparature calibration of softmax obsolete
+    //This may make temperature calibration of softmax obsolete
     template<typename T>
     void label_smoothing(T* dat, Image_Shape shape, float factor = 0.1f){
         for(uint32_t ind = 0; ind != shape.x * shape.y * shape.z; ind++) {
@@ -1169,7 +1225,7 @@ namespace Image {
         @param g: Green channel gets set to this value
         @param b: Blue  channel gets set to this value
     */
-    template<typename T, CHANNEL_ORDER ord> //TODO: Not working ccording to "show"
+    template<typename T, CHANNEL_ORDER ord> //TODO: Not working according to "show"
     void grayToRGBA(T* in, T* out, uint32_t len, T r, T g, T b) {
         if constexpr (ord == CHANNEL_ORDER::CHANNELS_FIRST) {
             T* i = in;
@@ -1220,11 +1276,11 @@ namespace CSV {
         static_assert(typeid(T) != typeid(T), "stringify has currently no implementation for the type u supplied");
     }
     template<> uint32_t destringify<uint32_t>(std::string in){ return std::stoul(in);}
-    template<>  int32_t destringify< int32_t>(std::string in){ return std::stoi(in); }
+    template<> int32_t  destringify< int32_t>(std::string in){ return std::stoi(in); }
     template<> uint16_t destringify<uint16_t>(std::string in){ return std::stoul(in);}
-    template<>  int16_t destringify< int16_t>(std::string in){ return std::stoi(in); }
+    template<> int16_t  destringify< int16_t>(std::string in){ return std::stoi(in); }
     template<> uint8_t  destringify<uint8_t >(std::string in){ return std::stoul(in);}
-    template<>  int8_t  destringify< int8_t >(std::string in){ return std::stoi(in); }
+    template<> int8_t   destringify< int8_t >(std::string in){ return std::stoi(in); }
     template<> float    destringify<float   >(std::string in){ return std::stof(in); }
     template<> double   destringify<double  >(std::string in){ return std::stod(in); }
   
@@ -1274,6 +1330,11 @@ namespace CSV {
         return out;
     }
 
+    /*
+        Takes a vector "dat" of "len" values in the range ]0, channels-1[.
+        Expands this to an image, as for each value is replaced by "channel" values - channels. The original value is used an an index. The channel of
+        thius index is set to 1, the other channels of this values are set to 0.
+    */
     template<typename T_in, typename T_out, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST>
     T_out* vec_to_img(T_in* dat, uint32_t len, uint32_t channels){
         uint32_t m1, m2;
@@ -1290,7 +1351,7 @@ namespace CSV {
         for(uint32_t ind = 0; ind != len; ind++){
             T_in val = dat[ind];
             for(uint32_t channel = 0; channel != channels; channel++){
-              out[channel * m1 + ind * m2] = (T_out)(channel == val);
+                out[channel * m1 + ind * m2] = (T_out)(channel == val);
             }
         }
 
@@ -1318,78 +1379,91 @@ namespace CSV {
     Each Dataset must start with a header. It consist of (in this order)
      - A 6 byte signature ("JVDATA")
      - 2 bytes that store the library version that was used to generate the dataset
-     - 2 bytes that store the lenght of the entire header
-     - An arbitrary amount of header data (as long as the lenght stored in the previous 2 bytes is right). This comes in the form of a HEADER_V* object
-
+     - A HEADER_V* object according to the version previously specified
+     
      After that, the data follows.
 
-     When a dataset is parsed, the whole header is converted into a HEADER object. Depending on which version of the library was used to generate the Dataset,
-     a different HEADER_V* class might have been used. They might have to get parsed differently into a HEADER object. 
-
-     This enables the Dataset-files to store more data in its header through using a bigger HEADER_V* class, as long a new method to parse this class into
-     an HEADER object is implemented. The HEADER class itself is not subject to change.
+     In newer versions of this library, the file format is allowed to change. In that case, one might want to use a different file header which stores
+     more or different infomation. In that case, implement a new HEADER_V* class. Whereever a HEADER_V* was used before, see what HEADER_V* version is
+     needed an implement the correct conversion in your new class and call this conversion at those places. Thus, only new conversions need to be implemented
+     and the code will still work.
 */
 
-struct HEADER{
-    uint32_t type;                //Type of data
-    uint32_t x;                   //Width  per sample
-    uint32_t y;                   //Height per sample
-    uint32_t z;                   //Depth  per sample
-    Image::CHANNEL_ORDER order;   //Channel order
-    Image::DATA_FORMAT format;    //Format of data
-    uint32_t bytes;               //Offset until real data starts
+struct HEADER_V1 {
+    uint32_t type;                //Type of data:        uint32_t  
+    uint32_t x;                   //Width per sample:    uint32_t  
+    uint32_t y;                   //Height per sample:   uint32_t  
+    uint32_t z;                   //Depth per sample:    uint32_t  
+    Image::CHANNEL_ORDER order;   //Channel order:       Image::CHANNEL_ORDER   
+    Image::DATA_FORMAT format;    //Format of data:      Image::DATA:FORMAT
 
-    HEADER(uint32_t type_,
-           uint32_t x_,
-           uint32_t y_,
-           uint32_t z_,
-           Image::CHANNEL_ORDER order_,
-           Image::DATA_FORMAT format_,
-           uint32_t bytes_)
-        :type(type_), x(x_), y(y_), z(z_), order(order_), format(format_), bytes(bytes_)
+    //Constructor
+    HEADER_V1() = default;
+
+    HEADER_V1(uint32_t type, uint32_t x, uint32_t y, uint32_t z, Image::CHANNEL_ORDER order, Image::DATA_FORMAT format) :
+        type(type),
+        x(x),
+        y(y),
+        z(z),
+        order(order),
+        format(format)
     {}
 
-    HEADER(const HEADER& h)
-        :type(h.type), x(h.x), y(h.y), z(h.z), order(h.order), format(h.format), bytes(h.bytes)
+    HEADER_V1(const HEADER_V1& h) :
+        type(h.type), x(h.x), y(h.y), z(h.z), order(h.order), format(h.format)
     {}
-};
-struct HEADER_V1{
-    uint32_t type;                //Type of data:        uint32_t  |
-    uint32_t x;                   //Width per sample:    uint32_t  |
-    uint32_t y;                   //Height per sample:   uint32_t  |
-    uint32_t z;                   //Depth per sample:    uint32_t  |
-    Image::CHANNEL_ORDER order;   //Channel order:       uint8_t   |
-    Image::DISTRIBUTION distr;    //Distribution:        uint8_t   |
-    float range;                  //Range of data:       uint32_t
-  
-    HEADER toHEADER(uint32_t bytes){
-        Image::DATA_FORMAT format(distr, range);
-        HEADER h(type, x, y, z, order, format, bytes);
-        return h;
+
+    //Conversion to different versions
+
+
+    //Serialization
+    void serialize(FILE* file) {
+        fwrite(&type, sizeof(type), 1, file);
+        fwrite(&x, sizeof(x), 1, file);
+        fwrite(&y, sizeof(y), 1, file);
+        fwrite(&z, sizeof(z), 1, file);
+        fwrite(&order, sizeof(order), 1, file);
+        format.serialize(file);
     }
-} __attribute__((packed));
+
+    static HEADER_V1 deserialize(FILE* file) {
+        HEADER_V1 ret{};
+        fread(&ret.type, sizeof(type), 1, file);
+        fread(&ret.x, sizeof(x), 1, file);
+        fread(&ret.y, sizeof(y), 1, file);
+        fread(&ret.z, sizeof(z), 1, file);
+        fread(&ret.order, sizeof(order), 1, file);
+        ret.format = Image::DATA_FORMAT::deserialize(file);
+        return ret;
+    }
+};
 
 //HEADER: |SIGNATURE(6)|VERSION(2)|HEADER_LENGHT(2)|TYPE(4)|SIZE.X(4)|SIZE.Y(4)|SIZE.Z(4)|CHANNEL_ORDER(1)|DISTRIBUTION(1)|RANGE(4)|------------DATA-------------|
 namespace DatasetAssemble {
     template<typename T, Image::CHANNELS channels = Image::CHANNELS::RGB, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST, Image::DISTRIBUTION distr = Image::DISTRIBUTION::UNIFORM, int32_t range = 1>
     void generateDatasetFile_Image(std::string dir, std::string file_out, Offset2D<uint32_t> size) {
+        //0.: Check arguments
         static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
 
+        //1.: Open file
         FILE* file = fopen(file_out.c_str(), "wb");    //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
 
+        //2.: Write file header
         printf("[INFO] Writing header\n");
         char signature[] = {"JVDATA"};
         uint16_t version = AI_VERSION;
-        uint16_t lenght;
-        Image::DATA_FORMAT format(distr, range);
-        HEADER_V1 header{type_hash<T>(), size.x, size.y, channels, order, format.distribution, format.range};
-        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
-
+        HEADER_V1 header(
+            type_hash<T>(), 
+            size.x, size.y, channels, 
+            order, 
+            Image::DATA_FORMAT(distr, range)
+        );
+        
         fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
         fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
-        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
-        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER_V*
+        header.serialize(file);
 
+        //3.: Read and sort filenames
         printf("[INFO] Reading in filenames\n");
         std::vector<std::string> paths;
         for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
@@ -1397,9 +1471,10 @@ namespace DatasetAssemble {
                 paths.push_back(entry.path().string());
             }
         }
-        printf("[INFO] Sorting filenames\n");
-        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs < rhs;});
+        printf("[INFO] Sorting filenames\n"); //Filenames are sorted, so that input and output files are matched correctly (same name, different extension)
+        std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs < rhs;}); 
 
+        //4.: Handle files one by one
         for(const std::string& in_file_path : paths){
             printf("[INFO] Handling file %s\n", in_file_path.c_str());
 
@@ -1420,23 +1495,28 @@ namespace DatasetAssemble {
     */
     template<typename T, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST, Image::DISTRIBUTION distr = Image::DISTRIBUTION::UNIFORM, int32_t range = 1>
     void generateDatasetFile_Classification(std::string dir, std::string file_out, uint32_t num_classes) {
+        //0.: Check arguments
         static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
 
+        //1.: Open file
         FILE* file = fopen(file_out.c_str(), "wb");     //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
 
+        //2.: Write file header
         printf("[INFO] Writing header\n");
         char signature[] = {"JVDATA"};
         uint16_t version = AI_VERSION;
-        uint16_t lenght;
-        Image::DATA_FORMAT format(distr, range);
-        HEADER_V1 header{type_hash<T>(), num_classes, 1, 1, order, format.distribution, format.range };
-        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
-
+        HEADER_V1 header(
+            type_hash<T>(), 
+            num_classes, 1, 1, 
+            order, 
+            Image::DATA_FORMAT(distr, range)
+        );
+        
         fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
         fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
-        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
-        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER
+        header.serialize(file);
 
+        //3.: Read and sort filenames
         printf("[INFO] Reading in filenames\n");
         std::vector<std::string> paths;
         for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
@@ -1444,9 +1524,10 @@ namespace DatasetAssemble {
               paths.push_back(entry.path().string());
             }
         }
-        printf("[INFO] Sorting filenames\n");
+        printf("[INFO] Sorting filenames\n");               //Sort filenames to corretly match input and output files (same name, different extension)
         std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs){return lhs < rhs;});
 
+        //4.: Handle file one by on
         for(const std::string& in_file_path : paths){
             printf("[INFO] Handling file %s\n", in_file_path.c_str());
 
@@ -1467,23 +1548,28 @@ namespace DatasetAssemble {
     */
     template<typename T, Image::CHANNEL_ORDER order = Image::CHANNEL_ORDER::CHANNELS_FIRST, Image::DISTRIBUTION distr = Image::DISTRIBUTION::UNIFORM, int32_t range = 1>
     void generateDatasetFile_Segmentation(std::string dir, std::string file_out, Image_Shape shape, Image::DATA_FORMAT old_format) {
+        //0.: Check arguments
         static_warning(distr == Image::DISTRIBUTION::UNIFORM, "A dataset should contain uniform data to enable easier augmentation!");
 
+        //1.: Open file
         FILE* file = fopen(file_out.c_str(), "wb");     //Otherwise, windows fucks with the 10 (puts "\r\n" instead of "\n" because it suuuuuucks)
 
+        //2.: Write file header
         printf("[INFO] Writing header\n");
         char signature[] = { "JVDATA" };
         uint16_t version = AI_VERSION;
-        uint16_t lenght;
-        Image::DATA_FORMAT format(distr, range);
-        HEADER_V1 header{ type_hash<T>(), shape.x, shape.y, shape.z, order, format.distribution, format.range };
-        lenght = sizeof(signature) - 1 + sizeof(version) + sizeof(lenght) + sizeof(header);
+        HEADER_V1 header(
+            type_hash<T>(), 
+            shape.x, shape.y, shape.z, 
+            order,
+            Image::DATA_FORMAT(distr, range)
+        );
 
         fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature:         6*uint8_t
         fwrite(&version  , sizeof(version)      , 1, file); //Version:             uint16_t
-        fwrite(&lenght   , sizeof(lenght)       , 1, file); //Header lenght:       uint16_t
-        fwrite(&header   , sizeof(header)       , 1, file); //Header data:         HEADER
+        header.serialize(file);
 
+        //3.: Read and sort filenames
         printf("[INFO] Reading in filenames\n");
         std::vector<std::string> paths;
         for (const auto& entry : __FILESYSTEM__::directory_iterator(dir)) {
@@ -1491,9 +1577,10 @@ namespace DatasetAssemble {
                 paths.push_back(entry.path().string());
             }
         }
-        printf("[INFO] Sorting filenames\n");
+        printf("[INFO] Sorting filenames\n");              //Sort filenames to correctly match input and output files (same name, different extension)
         std::sort(paths.begin(), paths.end(), [](const auto& lhs, const auto& rhs) {return lhs < rhs; });
 
+        //4.: Handle files one by one
         for (const std::string& in_file_path : paths) {
             printf("[INFO] Handling file %s\n", in_file_path.c_str());
 

@@ -106,6 +106,7 @@
   <ItemGroup>
     <ClCompile Include="Dataset.cpp" />
     <ClCompile Include="kernel.cpp" />
+    <ClCompile Include="Network.cpp" />
     <ClCompile Include="util.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
