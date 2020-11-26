@@ -10,13 +10,6 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #endif
 
-#ifndef DEBUG
-#define NDBUG
-#endif
-
-#define _LARGEFILE_SOURCE
-#define _FILE_OFFSET_BITS 64
-
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <cuda_fp16.h>
@@ -43,11 +36,17 @@
 #include "omp.h"
 #include <x86intrin.h>
 
+#include "Dataset.cpp"
 
-#include "util.cpp"
-using namespace Random;
-using namespace Image;
-using namespace DatasetAssemble;
+/*
+Notation conventions:
+ - A matrix has size height*width.
+ - layer[0] is the input layer
+ - weight[i] are the weights between layer[i] and layer[i+1]
+*/
+
+
+
 
 //TODOS (BOTH FILES!!)
 //TODO: Block all kernel calls
@@ -76,7 +75,6 @@ cublasHandle_t cublas_handle;
 
 enum Activation { RELU = 0, SIGMOID = 1, SOFTMAX = 2, SOFTPLUS = 3 };
 enum Optimizer_Type { SGD, ADAM, DEMON_ADAM };
-enum CublasMode { OVERWRITE = 0, ADD = 1 };                                //Don't change values!!
 
 struct OptVariables {
     Optimizer_Type opt_t;
@@ -89,21 +87,22 @@ struct OptVariables {
     uint32_t T;
 };
 
-template<typename T, Activation ACT> //Activation for hidden layer (not softmax), output layer use softmax by default
+template<typename T>
 class MultiLayerPerceptron {
 private:
-    uint32_t  num_layer;   //Number of layers
-    uint32_t* layer_size;  //Number of neurons per layer
-    uint32_t  batch_size;  //Number of samples per batch
+    uint32_t  num_layer;     //Number of layers
+    uint32_t* layer_size;    //Number of neurons per layer
+    Activation* activations; //The activation function for every layer
+    uint32_t  batch_size;    //Number of samples per batch
 
-    uint64_t num_neurons;  //Number of neurons not in the input layer
+    uint64_t num_neurons;  //Number of neurons !not in the input layer!
     uint64_t num_weights;  //Number of weights
 
     T** weights;  //Pointer to 2D-Array                                 | weights[i] has dimension layer_size[i+1] * layer_size[i], column major
     T** bias;     //Pointer to Array                                    | bias[i]    has dimension layer_size[i+1] * 1            , column major 
     T** output;   //Pointer to Array, after activation                  | output[i]  has dimension layer_size[i+1] * batch_size   , column major
 
-    OptVariables<T> opt_var; //Hold information on what optimizer to use
+    OptVariables<T> opt_var; //Holds information on what optimizer to use
     T*  opt_buf;             //Size of biggest output[] buffer. Temporary storage for optimizer
     T** opt_momentum_buf[2]; //Stores the momentum of all weights, if opt\in\{ADAM, DEMON_ADAM\}. Otherwise should be set to nullptr
     
@@ -111,77 +110,87 @@ private:
     T* cur_in;                     //Pointer to input data to use (testing, validation or custom)
     T* cur_out;                    //Pointer to output data to use (testing, validation or custom)
 
-    CublasMode cublasMode;
-    T* cublasConst;               //={1,cublasMode}. In GPU memory
+    T* cublasConst;               //={0, 1}. In GPU memory. Used to tell cublas whether to add or overwrite (x in A = x*A + y*(B*C))
 
-    //==========================================================
-    //========================|FUNCTION|========================
-    //==========================================================
-    inline void allocate() {//Allocates memory for weights and according to num_layer and layer_size in a contiuos array
-        //Analyse input
+    //=========================================================
+    //========================|UTILITY|========================
+    //=========================================================
+    /*
+        Allocates memory for weights and biases. Furthermore, it computes the correct pointers for each layer. Sets globals num_weights and num_neurons.
+
+        Memory is allocated in a contingous chunk.
+    */
+    inline void allocate() {
+        //1.: Count neurons and weights
         num_weights = 0;
         num_neurons = 0;
-        for (uint32_t layer = 1; layer != num_layer; layer++) {
-            num_weights += layer_size[layer - 1] * layer_size[layer];
-            num_neurons += layer_size[layer];
+        for (uint32_t layer = 0; layer != num_layer - 1; layer++) {
+            num_weights += layer_size[layer + 1] * layer_size[layer];
+            num_neurons += layer_size[layer + 1];
         }
 
-        //Allocate memory
+        //2.: Allocate gpu memory
         T* raw_mem;
         cudaMalloc(raw_mem, sizeof(T) * (num_weights + num_neurons));
 
-        T* weights_mem = raw_mem;
-        cudaMallocHost(&weights, sizeof(T*) * (num_layer - 1)); //First layer needs no weights
-        weights[0] = weights_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            weights[layer] = weights[layer - 1] + layer_size[layer - 1] * layer_size[layer];
+        //3.: Set weights pointers
+        weights = (T**)malloc(sizeof(T*) * (num_layer - 1)); //First layer needs no weights
+        for (uint32_t layer = 0; layer != num_layer - 1; layer++) {
+            weights[layer] = raw_mem;
+            raw_mem += layer_size[layer + 1] * layer_size[layer];
         }
 
-        T* bias_mem = raw_mem + num_weights;
-        cudaMallocHost(&bias, sizeof(T*) * (num_layer - 1)); //First layer needs no bias
-        bias[0] = bias_mem;
-        for (uint32_t layer = 1; layer != num_layer - 1; layer++) {
-            bias[layer] = bias[layer - 1] + layer_size[layer];
+        //4.: Set bias pointers
+        bias = (T**)malloc(sizeof(T*) * (num_layer - 1)); //First layer needs no bias
+        for (uint32_t layer = 0; layer != num_layer - 1; layer++) {
+            bias[layer] = raw_mem;
+            raw_mem += layer_size[layer + 1];
         }
     }
 
-    inline void set_cublasMode(bool b) {//true=add, false=overwrite
-        cublasMode = b;
-        T mode_cast = (T)cublasMode;
-        cudaMemcpy(&cublasConst[0], mode_cast, sizeof(T), cudaMemcpyHostToDevice);
-    }
+    /* 
+        Computes either the matrix multiplication C=trans_A(A)*trans_B(B) or C+=trans_A(A)*trans_B(B).
+        All matrices (A,B,C) have to be stored column major.
 
-    /* Matrix multiplication: C += A * B
-       Sizes: trans_A(A)=y1*x1, trans_B(B)=x1*x2, C=y1*x2  | trans_A swaps height and with of matrix
-       All matrices have to be stored column major!
+        @param A: Left  factor of matrix product that will be computed.
+        @param B: Right factor of matrix product that will be computed
+        @param C: Where to store the result of the multiplication
+        @param trans_A: Whether to transpose A before multiplication (swap height and width)
+        @param trans_B: Whether to transpose B before multiplication (swap height and width)
+        @param overwrite: If this is true, we overwrite C with the result of the matrix multiplication. If it is false, we add the result to the data in C
+        @param y1, x1, x2: trans_A(A) has size y1*x1. trans_B(B) has size x1*x2. C has size y1*y2.
     */
-    template<bool trans_A, bool trans_B>
+    template<bool trans_A, bool trans_B, bool overwrite>
     void matmul(T* A, T* B, T* C, uint32_t y1, uint32_t x1, uint32_t x2) {
-        static_assert(typeid(T)==typeid(float) || typeid(T)==typeid(double) || typeid(T)==typeid(half), "Matrix multiplication is not supported with this type!");
+        static_assert(typeid(T)==typeid(float) || typeid(T)==typeid(double) || typeid(T)==typeid(half), "[Error] Matrix multiplication is not supported with this type!");
         
         if constexpr (typeid(T) == typeid(float))
-            cublasSgemm(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, trans_A?x1:y1, B, trans_B?x2:x1, &cublasConst[1], C, y1);
+            cublasSgemm(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, trans_A?x1:y1, B, trans_B?x2:x1, &cublasConst[!overwrite], C, y1);
         if constexpr (typeid(T) == typeid(double))
-            cublasDgemm(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, trans_A?x1:y1, B, trans_B?x2:x1, &cublasConst[1], C, y1);
+            cublasDgemm(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, trans_A?x1:y1, B, trans_B?x2:x1, &cublasConst[!overwrite], C, y1);
         if constexpr (typeid(T) == typeid(half))
-            cublasGemmEx(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, CUDA_R_16F, trans_A?x1:y1, B, CUDA_R_16F, trans_B?x2:x1, &cublasConst[1], C, CUDA_R_16F, y1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            cublasGemmEx(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, &cublasConst[0], A, CUDA_R_16F, trans_A?x1:y1, B, CUDA_R_16F, trans_B?x2:x1, &cublasConst[!overwrite], C, CUDA_R_16F, y1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     }
     
     inline void forward_weight_mul(uint32_t ind, T* in) {//output[ind] += weights[ind] * in.
-        assert(cublasMode == CublasMode::ADD);
-        matmul<false, false>(weights[ind], in, output[ind], layer_size[ind + 1], layer_size[ind], batch_size);
+        matmul<false, false, false>(weights[ind], in, output[ind], layer_size[ind + 1], layer_size[ind], batch_size);
     }
     inline void backward_delta_mul(uint32_t ind, T* out) {//out = weights[ind+1]^T * output[ind+1]
-        assert(cublasMode == CublasMode::OVERWRITE);
-        matmul<true, false>(weights[ind + 1, output[ind + 1], out, layer_size[ind + 1], layer_size[ind + 2], batch_size);
+        matmul<true, false, true>(weights[ind + 1, output[ind + 1], out, layer_size[ind + 1], layer_size[ind + 2], batch_size);
     }
     inline void set_bias(uint32_t ind) {//Copy bias[i] to output[i] for all samples in batch
         uint32_t size_out = layer_size[ind + 1] * batch_size;
         set_repeating<T><<<LAUNCH_PARAM(size_out)>>>(output[ind], bias[ind], size_out, layer_size[ind + 1]);
     }
 
+    /*
+        Applies an activation function to a layer.
+
+        @param a: Specifies, which activation function to use
+        @param i: Specifies the layer (output[i], that means layer[i+1])
+    */
     template<Activation a> void activate(uint32_t i) {
-        static_assert(a == Activation::RELU || a == Activation::SIGMOID || a == Activation::SOFTPLUS || a == Activation::SOFTMAX, "Unknown activation");
+        static_assert(a == Activation::RELU || a == Activation::SIGMOID || a == Activation::SOFTPLUS || a == Activation::SOFTMAX, "[Error] Unknown activation");
 
         uint32_t s = layer_size[i + 1] * batch_size;
         if constexpr (a == Activation::RELU)     relu<T>(output[i], s, LAUNCH_PARAM(s));
@@ -193,14 +202,27 @@ private:
                 softmax<T>(sta, layer_size[i + 1], LAUNCH_PARAM(layer_size[i + 1]));
         }
     }
+    /*
+        When f is the activation function, it replaces f(x) with f'(x).
+
+        @param i: Specifies the layer (output[i], that means layer[i+1])
+    */
     inline void activate_derivative(uint32_t i) {//Replaces f(x) with f'(x)
-        static_assert(ACT == Activation::RELU || ACT == Activation::SIGMOID || ACT == Activation::SOFTPLUS, "Unknown activation for hidden layer");
+        static_assert(ACT == Activation::RELU || ACT == Activation::SIGMOID || ACT == Activation::SOFTPLUS, "[Error] Unknown activation for hidden layer");
         
         uint32_t s = layer_size[i + 1] * batch_size;
         if constexpr (ACT == Activation::RELU)     relu_deriv<T>(output[i], s, LAUNCH_PARAM(s));
         if constexpr (ACT == Activation::SIGMOID)  sigmoid_deriv<T>(output[i], s, LAUNCH_PARAM(s));
         if constexpr (ACT == Activation::SOFTPLUS) softplus_deriv<T>(output[i], s, LAUNCH_PARAM(s));
     }
+    /*
+        When f is the activation function, it computes f'(x) from f(x) and multiplies the result elementwise to an array.
+
+        @param in: Input pointer which stores f(x)
+        @param o:  Output array which to elementwise multiply f'(x) to
+        @param s: Number of elements in "in" and "o"
+        @param negate: If this is ture, multiply -f'(x) to o instead of f'(x)
+    */
     template<bool negate> void activate_derivative_mul(T* in, T* o, uint32_t s) {//*o *= f'(in)
         static_assert(ACT == Activation::RELU || ACT == Activation::SIGMOID || ACT == Activation::SOFTPLUS, "Unknown activation for hidden layer");
 

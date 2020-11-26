@@ -6,6 +6,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wwritable-strings"
+#pragma clang diagnostic ignored "-Wnull-conversion"
 #endif
 
 #include "cuda_runtime.h"
@@ -14,7 +15,9 @@
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#ifdef WIN32
 #include <C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0\um\gl\GLU.h>
+#endif
 
 #include <inttypes.h>
 #include <utility>
@@ -156,7 +159,7 @@ class DatasetHandler {
         (5.: "setDataInput")
         6.: Loop "advance". Step 2+3+4+5 can be repeated anytime in between
     */
-public: //FIXIT TODO: private
+private:
     FILE* fd_in, *fd_out;                 //File descritors of files holding dataset
     HEADER in_header, out_header;         //Header of files containing the datasets 
     Image_Shape sample_shape[4];          //The shape of unaugmented input/output samples in dataset ([0],[1]) and of augmented input/output samples([2], [3])
@@ -535,6 +538,13 @@ public: //FIXIT TODO: private
     // ||Debugging||
     // \+=========+/
 #ifdef DEBUG // Check, whether the DEBUG makro was defined during compilation. This is needed to get information from worker threads
+#ifdef WIN32
+#define FONT_PATH "C:/Windows/Fonts/Arial.ttf"
+#define YSTART 0
+#else
+#define FONT_PATH "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf"
+#define YSTART 300
+#endif
 #define XRES 1920
 #define YRES 1280
 #define XIMG 100
@@ -582,7 +592,7 @@ public: //FIXIT TODO: private
         //4.5: FreeType initialization and blending
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        TextRenderer::initFreeType("C:/Windows/Fonts/Arial.ttf", 100);
+        TextRenderer::initFreeType(FONT_PATH, 100);
 
         //5.: Refresh speed
         glfwSwapInterval(1);
@@ -617,7 +627,7 @@ public: //FIXIT TODO: private
             glLoadIdentity();
 
             uint32_t x = PADDING;
-            uint32_t y = PADDING;
+            uint32_t y = PADDING + YSTART;
 
             for (uint32_t ind = 0; ind != augmentation_batches_cpu * batch_size; ind++) {
                     //Image::show<T, true>(&aug_tiles[0][ind * sample_size[3]], in_shape, Image::CHANNEL_ORDER::CHANNELS_FIRST);
@@ -709,7 +719,7 @@ public: //FIXIT TODO: private
             for (uint32_t ind = 0; ind != num_workers; ind++) {
                 char text[255];
                 sprintf(text, "Worker %d last worked on augmentation tile %d", ind, workers_tile[ind + 1]);
-                TextRenderer::renderText(+text, PADDING, y + 400 +  100 * ind, 0.3f);
+                TextRenderer::renderText(+text, PADDING, y + 400 +  50 * ind, 0.3f);
             }
             glBindTexture(GL_TEXTURE_2D, tex);
 
@@ -733,11 +743,11 @@ public: //FIXIT TODO: private
     // \+================+/
     inline HEADER parseInputFile(FILE* fd, Image_Shape& shape, uint32_t& sample_size, uint32_t& num_samples){
         //1.: Signature
-        printf("[INFO] Parsing file...\n");
+        printf("[INFO] Parsing dataset file...\n");
         char sig[6];
         fread(+sig, sizeof(char), 6, fd);
         assert(strncmp(sig, "JVDATA", 6)==0);
-        printf("[INFO] \t - Header matches\n");
+        printf("[INFO] \t - Signature matches\n");
         
         //2.: Version
         uint16_t ver;
@@ -747,6 +757,7 @@ public: //FIXIT TODO: private
             printf("[INFO] \t - File version: %u. This is an old version, since this is library version %u\n", (uint32_t)ver, AI_VERSION);
         else
             printf("[INFO] \t - File version: %u. This is the recent version\n", (uint32_t)ver);
+        
         //3.: Lenght
         uint16_t len;
         fread(&len, sizeof(uint16_t), 1, fd);
@@ -888,7 +899,7 @@ public:
                 sample_shape[2] = Image_Shape((uint32_t)(sample_shape[0].x * agi_in.crop.x), (uint32_t)(sample_shape[0].y * agi_in.crop.y), sample_shape[0].z);
         }
         else                                                  //Resize controls size
-            sample_shape[2] = Image_Shape(agi_in.resize.x, agi_in.resize.y, sample_shape[0].z);
+          sample_shape[2] = Image_Shape((uint32_t)agi_in.resize.x, (uint32_t)agi_in.resize.y, sample_shape[0].z);
 
         //sample_shape[3]
         if (agi_out.resize.x == -1) {
@@ -898,7 +909,7 @@ public:
                 sample_shape[3] =  Image_Shape((uint32_t)(sample_shape[1].x * agi_in.crop.x), (uint32_t)(sample_shape[1].y * agi_in.crop.y), sample_shape[1].z);
         }
         else                                                  //Resize controls size
-            sample_shape[3] = Image_Shape(agi_out.resize.x, agi_out.resize.y, sample_shape[1].z);
+            sample_shape[3] = Image_Shape((uint32_t)agi_out.resize.x, (uint32_t)agi_out.resize.y, sample_shape[1].z);
 
         //Sizes
         sample_size[2] = sample_shape[2].x * sample_shape[2].y * sample_shape[2].z;
@@ -1297,13 +1308,13 @@ public:
 };
 
 //Old main function
-#if 0
+#ifdef MAIN
 using namespace DatasetAssemble;
 
-#define P_IN    "C:/Users/julia/source/repos/AI/Datasets/1/Raw/In"
-#define P_OUT   "C:/Users/julia/source/repos/AI/Datasets/1/Raw/Out"
-#define P_D_IN  "C:/Users/julia/source/repos/AI/Datasets/1/in.jvdata"
-#define P_D_OUT "C:/Users/julia/source/repos/AI/Datasets/1/out.jvdata"
+#define P_IN    "/home/julian//cuda-workspace/AI-master/Datasets/1/Raw/In"
+#define P_OUT   "/home/julian//cuda-workspace/AI-master/Datasets/1/Raw/Out"
+#define P_D_IN  "/home/julian//cuda-workspace/AI-master/Datasets/1/in.jvdata"
+#define P_D_OUT "/home/julian//cuda-workspace/AI-master/Datasets/1/out.jvdata"
 
 int main() {
     //Cuda Device options
@@ -1369,7 +1380,7 @@ int main() {
 }
 
 
-//Linux:   sudo g++ /home/julian/cuda-workspace/AI-master/AI/Dataset.cpp -o /home/julian/cuda-workspace/AI-master/AI/Dataset.exe -I"/home/julian/Downloads/CImg-2.9.2_pre070420" -I"/usr/local/cuda-10.0/include" -O3 -march=native -std=c++17 -Wall -lpthread -lz -ldl -lpng -ljpeg -lX11 -g
+//Linux:   sudo clang++ Dataset.cpp -o Dataset.exe -I"/home/julian/Libs/CImg-2.9.2_pre070420" -I"/usr/local/cuda-10.0/include" -I"/home/julian/Libs/glfw-3.3.2/include" -I"/home/julian/Libs/glew-2.1.0/include" -I"/home/julian/Libs/freetype-2.10.3/include" -L"/usr/local/cuda-10.0/lib64" -O0 -march=native -m64 -std=c++17 -Wall -ldl -lrt -lpthread -lz -lpng -ljpeg -lGL -lGLU -lGLEW -lglfw3 -lfreetype -lX11 -lcudart_static -lstdc++fs -g -DDEBUG -DMAIN -DEXPERIMENTAL_FILESYSTEM
 //Cygwin:  g++ Dataset.cpp -o Dataset.exe -I"D:\Librarys\CImg-2.9.2_pre070420" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0\include" -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v10.0/bin" -O3 -march=native -std=c++17 -Wall -lpthread -lz -ldl -lpng -ljpeg -lX11 -g
 //Windows: clang++ Dataset.cpp -o Dataset.exe -I"D:\Librarys\CImg-2.9.2_pre070420" -I"D:\Librarys\VS-NuGet\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0\include" -I"D:\Librarys\GLFW\include" -I"D:\Librarys\glew-2.1.0\include" -I"D:\Librarys\freetype-2.10.3\include" -L"D:\Librarys\GLFW\lib" -L"D:\Librarys\glew-2.1.0\lib\Release\x64" -L"D:\Librarys\VS-NuGet\lib" -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v10.0/bin" -L"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0\lib\x64" -L"D:\Librarys\freetype-2.10.3\objs" -O0 -march=native -m64 -std=c++17 -Wall -lzlib -llibpng16 -ljpeg -lkernel32 -luser32 -lgdi32 -lopengl32 -lglu32 -lglew32 -lglfw3dll -lpsapi -lwinspool -lcomdlg32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid -lodbc32 -lodbccp32 -lcudart_static -lfreetype -g -DDEBUG
-#endif                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+#endif

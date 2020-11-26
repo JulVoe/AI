@@ -1,0 +1,29 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "clang-x64",
+            "compilerArgs": [
+                "-I\"/home/julian/Libs/CImg-2.9.2_pre070420\"",
+                "-I\"/usr/local/cuda-10.0/include\"",
+                "-I\"/home/julian/Libs/glfw-3.3.2/include\"",
+                "-I\"/home/julian/Libs/glew-2.1.0/include\"",
+                "-I\"/home/julian/Libs/freetype-2.10.3/include\"",
+                "-L\"/usr/local/cuda-10.0/lib64\"",
+                "-march=native",
+                "-m64",
+                "-std=c++17",
+                "-DDEBUG",
+                "-DEXPERIMENTAL_FILESYSTEM"
+            ]
+        }
+    ],
+    "version": 4
+}

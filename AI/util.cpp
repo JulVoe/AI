@@ -57,6 +57,194 @@ uint16_t sizeOfType(uint32_t typeId) {
     }
 }
 
+//=======================================================
+//==================|ERROR CHECKING|=====================
+//=======================================================
+
+//C++
+#include <x86intrin.h>
+#define CONC_(x,y) x##y
+#define CONC(x,y) CONC_(x,y)
+#define BUGP(x) printf(x);fflush(stdout);
+#define PADDR(x) printf("|%p|\n",&(x));fflush(stdout);
+#define STALL(); while(true){}
+void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
+void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
+template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";assert(0==1);__builtin_unreachable();/*Unknown type*/}
+template<typename T> void PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
+template<typename T> void ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
+template<typename T> void ARR_PRINT_COLMAJ(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_*y+y_]);printf("\t");}printf("\n");}printf("----------------\n");}
+
+#ifndef static_warning
+#warning static_warning was not defined
+#include <cstdio>
+#define static_warning(a,b) do{if(!(a)){printf(b"\n");}}while(0);
+#endif
+
+//Cuda + Cublas
+#ifdef DEBUG
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "Cuda assertion triggered: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#define CHECK_CUDA_ERROR();\
+    do{\
+        auto error = cudaGetLastError(); \
+        if (error != cudaSuccess) {\
+            /* print the CUDA error message and exit*/\
+            printf("CUDA error: %s\n", cudaGetErrorString(error)); \
+        }\
+    } while (0);
+
+
+#define CUBLAS_ERROR(e); \
+    if((e)!=CUBLAS_STATUS_SUCCESS){\
+        printf("%d %d", __LINE__, e);\
+    }
+#else
+#define gpuErrchk(ans)
+#define CHECK_CUDA_ERROR()
+#define CUBLAS_ERROR(e)
+#endif
+
+//OpenGl
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#ifdef WIN32
+#include <C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0\um\gl\GLU.h>
+#endif
+void showGLerror()
+{
+    GLenum err;
+
+    while ((err = glGetError()) != GL_NO_ERROR)
+        fprintf(stderr, "[Error] OpenGL Error-Code: %d. This is an %s.\n", err, gluErrorString(err));
+}
+
+const char* ETB_GL_DEBUG_SOURCE_STR(GLenum source)
+{
+    static const char* sources[] = {
+      "API",   "Window System", "Shader Compiler", "Third Party", "Application",
+      "Other", "Unknown"
+    };
+
+    int str_idx =
+        min<int>(source - GL_DEBUG_SOURCE_API,
+            sizeof(sources) / sizeof(const char*));
+
+    return sources[str_idx];
+}
+
+const char* ETB_GL_DEBUG_TYPE_STR(GLenum type)
+{
+    static const char* types[] = {
+      "Error",       "Deprecated Behavior", "Undefined Behavior", "Portability",
+      "Performance", "Other",               "Unknown"
+    };
+
+    int str_idx =
+        min<int>(type - GL_DEBUG_TYPE_ERROR,
+            sizeof(types) / sizeof(const char*));
+
+    return types[str_idx];
+}
+
+const char* ETB_GL_DEBUG_SEVERITY_STR(GLenum severity)
+{
+    static const char* severities[] = {
+      "High", "Medium", "Low", "Unknown"
+    };
+
+    int str_idx =
+        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
+            sizeof(severities) / sizeof(const char*));
+
+    return severities[str_idx];
+}
+
+uint32_t ETB_GL_DEBUG_SEVERITY_COLOR(GLenum severity)
+{
+    static uint32_t severities[] = {
+      0xff0000ff, // High (Red)
+      0xff00ffff, // Med  (Yellow)
+      0xff00ff00, // Low  (Green)
+      0xffffffff  // ???  (White)
+    };
+
+    int col_idx =
+        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
+            sizeof(severities) / sizeof(uint32_t));
+
+    return severities[col_idx];
+}
+
+#define eTB_ColorPrintf printf
+#define eTB_FlushConsole(); std::fflush(stdout);
+void ETB_GL_ERROR_CALLBACK(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, GLvoid* userParam)
+{
+    eTB_ColorPrintf(/*0xff00ffff,*/ "OpenGL Error:\n");
+    eTB_ColorPrintf(/*0xff808080,*/ "=============\n");
+    /*			 */
+    eTB_ColorPrintf(/*0xff6060ff,*/ " Object ID: ");
+    eTB_ColorPrintf(/*0xff0080ff,*/ "%d\n", id);
+    /*			 */
+    eTB_ColorPrintf(/*0xff60ff60,*/ " Severity:  ");
+    eTB_ColorPrintf(/*ETB_GL_DEBUG_SEVERITY_COLOR(severity),*/
+        "%s\n",
+        ETB_GL_DEBUG_SEVERITY_STR(severity));
+
+    eTB_ColorPrintf(/*0xffddff80,*/ " Type:      ");
+    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_TYPE_STR(type));
+    /*			 */
+    eTB_ColorPrintf(/*0xffddff80,*/ " Source:    ");
+    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_SOURCE_STR(source));
+    /*			 */
+    eTB_ColorPrintf(/*0xffff6060,*/ " Message:   ");
+    eTB_ColorPrintf(/*0xff0000ff,*/ "%s\n\n", message);
+
+    // Force the console to flush its contents before executing a breakpoint
+    eTB_FlushConsole();
+}
+
+void CheckDebugLog()
+{
+    constexpr unsigned int count = 10; // max. num. of messages that will be read from the log
+    constexpr unsigned int bufsize = 2048;
+
+    unsigned int* sources = new unsigned int[count];
+    unsigned int* types = new unsigned int[count];
+    unsigned int* ids = new unsigned int[count];
+    unsigned int* severities = new unsigned int[count];
+    int* lengths = new          int[count];
+
+    char* messageLog = new char[bufsize];
+    unsigned int retVal = glGetDebugMessageLogARB(count, bufsize, sources, types, ids, severities, lengths, messageLog);
+
+    if (retVal > 0)
+    {
+        unsigned int pos = 0;
+        for (unsigned int i = 0; i < retVal; i++)
+        {
+            printf("Source:%s\tType:%s\tID:%d\tSeverity:%s\tMessage:%s\n", ETB_GL_DEBUG_SOURCE_STR(sources[i]), ETB_GL_DEBUG_TYPE_STR(types[i]), ids[i], ETB_GL_DEBUG_SEVERITY_STR(severities[i]), &messageLog[pos]);
+            pos += lengths[i];
+        }
+    }
+
+    delete[] sources;
+    delete[] types;
+    delete[] ids;
+    delete[] severities;
+    delete[] lengths;
+    delete[] messageLog;
+}
+
+#define ALL_GL_ERRORS(); CheckDebugLog(); showGLerror();
+
 //===============================================
 //==================|RANDOM|=====================
 //===============================================
@@ -217,6 +405,10 @@ struct Image_Shape {
         z = channels;
 
         assert(x * y * z == len);
+    }
+
+    uint32_t prod(){
+        return x * y * z;
     }
 
     template<typename T = uint32_t>
@@ -1109,8 +1301,6 @@ namespace CSV {
 //===========================================================
 //==================|DATASET GENERATING|=====================
 //===========================================================
-//#define EXPERIMENTAL_FILESYSTEM
-
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -1326,189 +1516,6 @@ namespace DatasetAssemble {
     }
 }
 
-
-//=======================================================
-//==================|ERROR CHECKING|=====================
-//=======================================================
-
-//C++
-#include <x86intrin.h>
-#define CONC_(x,y) x##y
-#define CONC(x,y) CONC_(x,y)
-#define BUGP(x) printf(x);fflush(stdout);
-#define PADDR(x) printf("|%p|\n",&(x));fflush(stdout);
-#define STALL(); while(true){}
-void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
-void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
-template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";assert(0==1);__builtin_unreachable();/*Unknown type*/}
-template<typename T> void PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
-template<typename T> void ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
-
-#ifndef static_warning
-#warning static_warning was not defined
-#include <cstdio>
-#define static_warning(a,b) do{if(!(a)){printf(b"\n");}}while(0);
-#endif
-
-//Cuda + Cublas
-#ifdef DEBUG
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
-{
-    if (code != cudaSuccess)
-    {
-        fprintf(stderr, "Cuda assertion triggered: %s %s %d\n", cudaGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
-#define CHECK_CUDA_ERROR();\
-    do{\
-        auto error = cudaGetLastError(); \
-        if (error != cudaSuccess) {\
-            /* print the CUDA error message and exit*/\
-            printf("CUDA error: %s\n", cudaGetErrorString(error)); \
-        }\
-    } while (0);
-
-
-#define CUBLAS_ERROR(e); \
-    if((e)!=CUBLAS_STATUS_SUCCESS){\
-        printf("%d %d", __LINE__, e);\
-    }
-#else
-#define gpuErrchk(ans)
-#define CHECK_CUDA_ERROR()
-#define CUBLAS_ERROR(e)
-#endif
-
-//OpenGl
-#include <C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0\um\gl\GLU.h>
-void showGLerror()
-{
-    GLenum err;
-
-    while ((err = glGetError()) != GL_NO_ERROR)
-        fprintf(stderr, "[Error] OpenGL Error-Code: %d. This is an %s.\n", err, gluErrorString(err));
-}
-
-const char* ETB_GL_DEBUG_SOURCE_STR(GLenum source)
-{
-    static const char* sources[] = {
-      "API",   "Window System", "Shader Compiler", "Third Party", "Application",
-      "Other", "Unknown"
-    };
-
-    int str_idx =
-        min<int>(source - GL_DEBUG_SOURCE_API,
-            sizeof(sources) / sizeof(const char*));
-
-    return sources[str_idx];
-}
-
-const char* ETB_GL_DEBUG_TYPE_STR(GLenum type)
-{
-    static const char* types[] = {
-      "Error",       "Deprecated Behavior", "Undefined Behavior", "Portability",
-      "Performance", "Other",               "Unknown"
-    };
-
-    int str_idx =
-        min<int>(type - GL_DEBUG_TYPE_ERROR,
-            sizeof(types) / sizeof(const char*));
-
-    return types[str_idx];
-}
-
-const char* ETB_GL_DEBUG_SEVERITY_STR(GLenum severity)
-{
-    static const char* severities[] = {
-      "High", "Medium", "Low", "Unknown"
-    };
-
-    int str_idx =
-        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
-            sizeof(severities) / sizeof(const char*));
-
-    return severities[str_idx];
-}
-
-DWORD ETB_GL_DEBUG_SEVERITY_COLOR(GLenum severity)
-{
-    static DWORD severities[] = {
-      0xff0000ff, // High (Red)
-      0xff00ffff, // Med  (Yellow)
-      0xff00ff00, // Low  (Green)
-      0xffffffff  // ???  (White)
-    };
-
-    int col_idx =
-        min<int>(severity - GL_DEBUG_SEVERITY_HIGH,
-            sizeof(severities) / sizeof(DWORD));
-
-    return severities[col_idx];
-}
-
-#define eTB_ColorPrintf printf
-#define eTB_FlushConsole(); std::fflush(stdout);
-void ETB_GL_ERROR_CALLBACK(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, GLvoid* userParam)
-{
-    eTB_ColorPrintf(/*0xff00ffff,*/ "OpenGL Error:\n");
-    eTB_ColorPrintf(/*0xff808080,*/ "=============\n");
-    /*			 */
-    eTB_ColorPrintf(/*0xff6060ff,*/ " Object ID: ");
-    eTB_ColorPrintf(/*0xff0080ff,*/ "%d\n", id);
-    /*			 */
-    eTB_ColorPrintf(/*0xff60ff60,*/ " Severity:  ");
-    eTB_ColorPrintf(/*ETB_GL_DEBUG_SEVERITY_COLOR(severity),*/
-        "%s\n",
-        ETB_GL_DEBUG_SEVERITY_STR(severity));
-
-    eTB_ColorPrintf(/*0xffddff80,*/ " Type:      ");
-    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_TYPE_STR(type));
-    /*			 */
-    eTB_ColorPrintf(/*0xffddff80,*/ " Source:    ");
-    eTB_ColorPrintf(/*0xffccaa80,*/ "%s\n", ETB_GL_DEBUG_SOURCE_STR(source));
-    /*			 */
-    eTB_ColorPrintf(/*0xffff6060,*/ " Message:   ");
-    eTB_ColorPrintf(/*0xff0000ff,*/ "%s\n\n", message);
-
-    // Force the console to flush its contents before executing a breakpoint
-    eTB_FlushConsole();
-}
-
-void CheckDebugLog()
-{
-    constexpr unsigned int count = 10; // max. num. of messages that will be read from the log
-    constexpr unsigned int bufsize = 2048;
-
-    unsigned int* sources = new unsigned int[count];
-    unsigned int* types = new unsigned int[count];
-    unsigned int* ids = new unsigned int[count];
-    unsigned int* severities = new unsigned int[count];
-    int* lengths = new          int[count];
-
-    char* messageLog = new char[bufsize];
-    unsigned int retVal = glGetDebugMessageLogARB(count, bufsize, sources, types, ids, severities, lengths, messageLog);
-
-    if (retVal > 0)
-    {
-        unsigned int pos = 0;
-        for (unsigned int i = 0; i < retVal; i++)
-        {
-            printf("Source:%s\tType:%s\tID:%d\tSeverity:%s\tMessage:%s\n", ETB_GL_DEBUG_SOURCE_STR(sources[i]), ETB_GL_DEBUG_TYPE_STR(types[i]), ids[i], ETB_GL_DEBUG_SEVERITY_STR(severities[i]), &messageLog[pos]);
-            pos += lengths[i];
-        }
-    }
-
-    delete[] sources;
-    delete[] types;
-    delete[] ids;
-    delete[] severities;
-    delete[] lengths;
-    delete[] messageLog;
-}
-
-#define ALL_GL_ERRORS(); CheckDebugLog(); showGLerror();
 
 //=======================================================
 //==================|TEXT RENDERING|=====================

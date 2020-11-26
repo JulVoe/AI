@@ -250,7 +250,7 @@ __global__ void transform(T* in, uint32_t n, F f, G g) {
         in[i] = f(in[i], var);
 }
 
-//in1[i] = f(in1[i], in2[i]); 0<=n<n
+//in1[i] = f(in1[i], in2[i]); 0<=i<n
 template<typename T, typename F>
 __global__ void transform(T* in1, T* in2, uint32_t n, F f) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -418,7 +418,7 @@ void set_random(T* in, uint32_t s1, uint32_t s2 = 1) {
 
     float mul = sqrt(2.f / s1);
     auto ldb = [mul]__device__(curandState_t* s) { return  mul * curand_normal(s) };
-    set<T, decltype(ldb), decltype(init), curandState_t>(in, s1 * s2, ldb, init);
+    transform<T, decltype(ldb), decltype(init), curandState_t>(in, s1 * s2, ldb, init);
 }
 
 template<typename T>
@@ -512,6 +512,11 @@ void softplus_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //o
 //===================================================
 //==================|LAST LAYER|=====================
 //===================================================
+template<typename T>
+__global__ void softmaxTemperature(T* in, uint32_t n_per_batch, uint32_t batch_size, T temp = (T)1){
+    //TODO
+}
+
 template<typename T>
 void softmax(T* in, uint32_t n, uint32_t g, uint32_t b) {
     T acc;
