@@ -187,7 +187,7 @@ private:
     uint32_t aug_padding[2];              //Padding to add to aug tiles to be able to accomodate copy of size sample_size[0/1] and intermediates
     std::atomic<BATCH_STATUS>* ready_cpu; //Stores the status for ech batch in aug_tiles
     
-    T* gpu_tiles[2];                      //Holds start of tiles (gpu) = {input, output}  
+    T* gpu_tiles[2];                      //Holds start of tiles (gpu) = {input, output}. Owns memory
     T* cur_gpu[2];                        //Holds last used element in tiles (gpu) = {input, output}. If gpu_tiles was reloaded, cur_gpu[0]=nullptr
     std::atomic<BATCH_STATUS>* ready_gpu; //Stores the status for ech batch in gpu_tiles
 

@@ -13,7 +13,7 @@ CLANG_CUDAFLAGS   = --cuda-gpu-arch=sm_75 --cuda-path="C:/Program Files/NVIDIA G
 GCC      = "C:/msys64/usr/bin/g++.exe"
 GCCFLAGS = -fopenmp -Wall -Wextra -std=c++17 -march=native -fmax-errors=100 -O3
 
-MVSCFLAGS = /EHsc /nologo /Ox  /FS /Zi /MT /openmp:experimental /std:c++14
+MVSCFLAGS = /EHsc /nologo /Ox /FS /Zi /MT /openmp:experimental /std:c++14
 
 NVCC          := "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v10.2/bin/nvcc.exe"
 CUDAFLAGS      = -gencode=arch=compute_75,code=\"sm_75,compute_75\" --use-local-env --keep-dir x64/Release --machine 64 -cudart static -O3 --std=c++14 -expt-relaxed-constexpr -expt-extended-lambda

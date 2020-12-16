@@ -1,3 +1,4 @@
+#pragma once
 //TODO: RANDOM and IMAGE namespace algorithms are slow
 #define AI_VERSION 0u
 
@@ -69,8 +70,8 @@ uint16_t sizeOfType(uint32_t typeId) {
 #define PADDR(x) printf("|%p|\n",&(x));fflush(stdout);
 #define STALL(); while(true){}
 void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
-void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
-template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";assert(0==1);__builtin_unreachable();/*Unknown type*/}
+void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }                                                                                                                                            
+template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";if(std::is_pointer<T>::value)return "%p";assert(0==1);__builtin_unreachable();/*Unknown type*/}
 template<typename T> void  PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
 template<typename T> void  ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
 template<typename T> void  ARR_PRINT_COLMAJ(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_*y+y_]);printf("\t");}printf("\n");}printf("----------------\n");}

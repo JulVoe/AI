@@ -104,9 +104,11 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="cuda_alloc.cpp" />
     <ClCompile Include="Dataset.cpp" />
     <ClCompile Include="kernel.cpp" />
     <ClCompile Include="Network.cpp" />
+    <ClCompile Include="testing.cpp" />
     <ClCompile Include="util.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
