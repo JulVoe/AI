@@ -80,10 +80,10 @@ template<typename T> struct __device_builtin__ __builtin_align__(4 * sizeof(T)) 
 @param n_in: lenght of in
 @template div: is n_out divisible by blockDim.x?
 */
-template<typename T, DIVISIBILITY div>
+template<typename T, DIVISIBILITY N_divisible_blocksize>
 __global__ void set_repeating(T* out, T* in, uint32_t n_out, uint32_t n_in) {
     bool div_;
-    if constexpr (div == DIVISIBILITY::UNKNOWN)
+    if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
         div_ = ((n_out % blockDim.x) == 0);
 
     for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
@@ -106,10 +106,10 @@ __global__ void set_repeating(T* out, T* in, uint32_t n_out, uint32_t n_in) {
 }
 
 //Same as above, but with constexpr n_in to eliminate slow modulo
-template<typename T, DIVISIBILITY div, uint32_t n_in>
-__global__ void set_repeating(T* out, T* in, uint32_t n_out) {
+template<typename T, DIVISIBILITY N_divisible_blocksize, uint32_t n_in>
+__global__ void set_repeating2(T* out, T* in, uint32_t n_out) {
     bool div_;
-    if constexpr (div == DIVISIBILITY::UNKNOWN)
+    if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
         div_ = ((n_out % blockDim.x) == 0);
 
     for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
@@ -230,33 +230,13 @@ __global__ void transform(T* in, uint32_t n, F f) {
         in[i] = f(in[i]);
 }
 
-//Same as above, but calls g at the beginning to initialize additional variable
-template<typename T, typename F, typename G, typename V>
-__global__ void transform(T* in, uint32_t n, F f, G g) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    V var;
-    g(&var, idx);
-
-    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
-        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
-        val.a = f(val.a, var);
-        val.b = f(val.b, var);
-        val.c = f(val.c, var);
-        val.d = f(val.d, var);
-        reinterpret_cast<var4<T>*>(in)[i] = val;
-    }
-    int i = idx + n / 4 * 4;
-    if (i < n)
-        in[i] = f(in[i], var);
-}
-
 //in1[i] = f(in1[i], in2[i]); 0<=i<n
 template<typename T, typename F>
-__global__ void transform(T* in1, T* in2, uint32_t n, F f) {
+__global__ void transform2(T* in1, T* in2, uint32_t n, F f) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
-        var4<T> val = reinterpret_cast<var4<T>*>(in1)[i];
-        var4<T> val = reinterpret_cast<var4<T>*>(in2)[i];
+        var4<T> val1 = reinterpret_cast<var4<T>*>(in1)[i];
+        var4<T> val2 = reinterpret_cast<var4<T>*>(in2)[i];
         val1.a = f(val1.a, val2.a);
         val1.b = f(val1.b, val2.b);
         val1.c = f(val1.c, val2.c);
@@ -268,8 +248,28 @@ __global__ void transform(T* in1, T* in2, uint32_t n, F f) {
         in1[i] = f(in1[i], in2[i]);
 }
 
+//Same as above, but calls g at the beginning to initialize additional variable
+template<typename T, typename F, typename G, typename V>
+__global__ void transform3(T* in, uint32_t n, F f, G g) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    V var;
+    g(&var, idx);
+
+    for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
+        var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
+        val.a = f(val.a, &var);
+        val.b = f(val.b, &var);
+        val.c = f(val.c, &var);
+        val.d = f(val.d, &var);
+        reinterpret_cast<var4<T>*>(in)[i] = val;
+    }
+    int i = idx + n / 4 * 4;
+    if (i < n)
+        in[i] = f(in[i], &var);
+}
+
 template<typename T, typename F, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32, bool write>
-__global__ void transform_reduce(T* in, T* out, uint32_t n, F f) {
+__global__ void transform_reduce1(T* in, T* out, uint32_t n, F f) {
     //0.: Compute unknown divisibilities
     bool N_divisible_blocksize_, N_divisible_32_;
     if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
@@ -330,7 +330,7 @@ __global__ void transform_reduce(T* in, T* out, uint32_t n, F f) {
 }
 
 template<typename T, typename F, DIVISIBILITY N_divisible_blocksize, DIVISIBILITY N_divisible_32, bool write>
-__global__ void transform_reduce(T* in1, T* in2, T* out, uint32_t n, F f) {
+__global__ void transform_reduce2(T* in1, T* in2, T* out, uint32_t n, F f) {
     //0.: Compute unknown divisibilities
     bool N_divisible_blocksize_, N_divisible_32_;
     if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
@@ -400,7 +400,7 @@ void reduceLauncher(T* in, T* out, uint32_t N) {
 template<typename T>
 void multiplyElementwise(T* A, T* B, uint32_t n, uint32_t b, uint32_t g) {
     constexpr auto ldb = []__device__(T a, T b) { return a * b; };
-    transform<T, decltype(ldb)><<<g, b>>>(A, B, n, ldb)
+    transform2<T, decltype(ldb)><<<g, b >>>(A, B, n, ldb);
 }
 
 //===============================================
@@ -410,30 +410,31 @@ void multiplyElementwise(T* A, T* B, uint32_t n, uint32_t b, uint32_t g) {
 //however it is not feasible to store a state for every thread as this would require an unknown memory lenght
 
 /*
-    @param b: If false, use completly random values.
+    @param smart: If false, use completly random values.
 */
-template<typename T, bool b>
-void set_random(T* in, uint32_t s1, uint32_t s2 = 1) {
-    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
+template<typename T, bool smart>
+void set_random(T* in, uint32_t s1, uint32_t s2, uint32_t g, uint32_t b) {
+    auto init = []__device__(curandState_t * s, int idx) { curand_init(1337, idx, 0, s); };
 
     float mul = sqrt(2.f / s1);
-    auto ldb = [mul]__device__(curandState_t* s) { return  mul * curand_normal(s) };
-    transform<T, decltype(ldb), decltype(init), curandState_t>(in, s1 * s2, ldb, init);
+    auto ldb = [mul]__device__(T in, curandState_t * s) { return  mul * curand_normal(s); };
+    
+    transform3<T, decltype(ldb), decltype(init), curandState_t><<<g, b>>>(in, s1 * s2, ldb, init);
 }
 
 template<typename T>
-void random_noise(T* in, uint32_t n, T devi) {
-    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
-    auto ldb = [devi]__device__(T in, curandState_t* s) { return in + devi * curand_normal(s) };
-    transform<T , decltype(ldb), decltype(init), curandState_t>(in, n, ldb, init);
+void random_noise(T* in, uint32_t n, T devi, uint32_t g, uint32_t b) {
+    auto init = []__device__(curandState_t * s, int idx) { curand_init(1337, idx, 0, s); };
+    auto ldb = [devi]__device__(T in, curandState_t * s) { return in + devi * curand_normal(s); };
+    transform3<T, decltype(ldb), decltype(init), curandState_t> << <g, b >> > (in, n, ldb, init);
 }
 
 template<typename T>
-void random_dropout(T* in, uint32_t n, float prob) {
-    auto init = []__device__(curandState_t* s, int idx) { curand_init(1337, idx, 0, s); }
+void random_dropout(T* in, uint32_t n, float prob, uint32_t g, uint32_t b) {
+    auto init = []__device__(curandState_t * s, int idx) { curand_init(1337, idx, 0, s); };
     float rec = 1.f - prob;
-    auto ldb = [rec]__device__(T in, curandState_t* s) { return in * (uint32_t)(rec + curand_uniform(s)) }; //It makes no difference, if cast is to int or unsigned: cvt.rzi.s32.f32 and cvt.rzi.u32.f32 are generated respectivly
-    transform<T, decltype(ldb), decltype(init), curandState_t>(in, n, ldb, init);
+    auto ldb = [rec]__device__(T in, curandState_t * s) { return in * (uint32_t)(rec + curand_uniform(s)); }; //It makes no difference, if cast is to int or unsigned: cvt.rzi.s32.f32 and cvt.rzi.u32.f32 are generated respectivly
+    transform3<T, decltype(ldb), decltype(init), curandState_t> << <g, b >> > (in, n, ldb, init);
 }
 
 //=====================================================
@@ -454,8 +455,8 @@ void relu_deriv(T* in, uint32_t n, uint32_t g, uint32_t b) {//in[i] = f'(f^-1(in
 
 template<typename T, bool negate>
 void relu_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //out[i] *= f'(f^-1(in[i]))
-    constexpr auto ldb   = []__device__(T o, T i) { return in > (T)0 ? (T)o  : (T)0; };
-    constexpr auto ldb_n = []__device__(T o, T i) { return in > (T)0 ? (T)-o : (T)0; };
+    constexpr auto ldb   = []__device__(T o, T i) { return i > (T)0 ? (T)o  : (T)0; };
+    constexpr auto ldb_n = []__device__(T o, T i) { return i > (T)0 ? (T)-o : (T)0; };
     
     if constexpr (negate)
         transform<T, decltype(ldb  )><<<g, b>>>(out, in, n, ldb  );
@@ -471,14 +472,14 @@ void sigmoid(T* in, uint32_t n, uint32_t g, uint32_t b) { //Blocksize 64/384
 
 template<typename T>
 void sigmoid_deriv(T* in, uint32_t n, uint32_t g, uint32_t b) {
-    constexpr auto ldb = []__device__(T in) { return in * ((T)1 - in); }
+    constexpr auto ldb = []__device__(T in) { return in * ((T)1 - in); };
     transform<T, decltype(ldb)><<<g, b>>>(in, n, ldb);
 }
 
 template<typename T, bool negate>
 void sigmoid_deriv_mul(T* in, T* out, uint32_t n, uint32_t g, uint32_t b) { //out[i] *= f'(f^-1(in[i]))
-    constexpr auto ldb   = []__device__(T o, T i) { return o * (in * ((T)1 - in)); };
-    constexpr auto ldb_n = []__device__(T o, T i) { return o * (in * (in - (T)1)); };
+    constexpr auto ldb   = []__device__(T o, T i) { return o * (i * ((T)1 - i)); };
+    constexpr auto ldb_n = []__device__(T o, T i) { return o * (i * (i - (T)1)); };
     
     if constexpr (negate)
         transform<T, decltype(ldb_n)><<<g, b>>>(out, in, n, ldb_n);
@@ -517,15 +518,17 @@ __global__ void softmaxTemperature(T* in, uint32_t n_per_batch, uint32_t batch_s
     //TODO
 }
 
+#if 0
 template<typename T>
-void softmax(T* in, uint32_t n, uint32_t g, uint32_t b) {
-    T acc;
+void softmax(T* in, uint32_t n, uint32_t g, uint32_t b) { //TODO: complete shit
+    T acc; 
     auto ldb = []__device__(T in) { return exponential<T>(in); };
 
-    transform_reduce<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, true><<<g, b>>>(in, &acc, n, ldb);
+    transform_reduce1<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, true><<<g, b>>>(in, &acc, n, ldb);
     acc = (T)1 / acc;
     transform<<<g, b>>>(in, n, [acc]__device__(T in) { return in * acc; });
 }
+#endif
 
 template<typename T>
 T cross_entropy_loss(T* in, T* expected, uint32_t n, uint32_t g, uint32_t b) {
@@ -533,8 +536,8 @@ T cross_entropy_loss(T* in, T* expected, uint32_t n, uint32_t g, uint32_t b) {
     cudaMalloc(&ret, sizeof(T));
     cudaMemset(ret, 0, sizeof(T));
 
-    auto ldb = []__device__(T o, T expec) { return expec * logarithm<float>(o); };
-    transform_reduce<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false><<<g, b>>>(in, expected, ret, n, ldb);
+    auto ldb = []__device__(T o, T expec) { return expec * logarithm<T>(o); };
+    transform_reduce1<T, decltype(ldb), DIVISIBILITY::UNKNOWN, DIVISIBILITY::UNKNOWN, false><<<g, b>>>(in, expected, ret, n, ldb);
     
     T ret_;
     cudaMemcpy(&ret_, ret, sizeof(T), cudaMemcpyDeviceToHost);
@@ -562,14 +565,15 @@ where L is loss(cross entropy), y_i is output of neuron, x_i is before activatio
 template<typename T>
 void softmax_cross_entropy_deriv(T* in, T* expected, uint32_t n, uint32_t g, uint32_t b) {
     auto ldb = []__device__(T o, T expec) { return o - expec; };
-    transform<T, decltype(ldb)>(in, expected, n, f);
+    transform2<T, decltype(ldb)>(in, expected, n, f);
 }
 
 //==================================================
 //==================|OPTIMIZER|=====================
 //==================================================
+#if 0
 template<typename T>
-__global__ void sgd(T* w, T* delta, T* in, T scalar, uint32_t w_y, uint32_t w_x, uint32_t batch_size) {
+__global__ void sgdMul (T* weigths, T* delta, T* in, T* scalar, uint32_t w_y, uint32_t w_x, uint32_t batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < w_y * w_x * batch_size) {
@@ -578,12 +582,13 @@ __global__ void sgd(T* w, T* delta, T* in, T scalar, uint32_t w_y, uint32_t w_x,
         int y = idx % w_y;
         int x = idx / w_y;
 
-        atomicAdd(weight[y + x * w_y], scalar * in[b * w_x + x] * delta[b * w_y + y]]));
-    } //index of weight is idx, compiler will optimize it away
+        atomicAdd(&weigths[y + x * w_y], *scalar * in[b * w_x + x] * delta[b * w_y + y]);
+    } //index of "weigths" is "idx", compiler will optimize it away
 }
+#endif
 
 template<typename T>
-__global__ void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
+__global__ void adam(T* weight, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < w_y * w_x * batch_size) {
@@ -592,7 +597,7 @@ __global__ void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T 
         int y = idx % w_y;
         int x = idx / w_y;
 
-        T grad = in[b * w_x + x] * delta[b * w_y + y]] / batch_size;
+        T grad = in[b * w_x + x] * delta[b * w_y + y] / batch_size;
         T tmp1 = mom1[y + x * w_y];
         T tmp2 = mom2[y + x * w_y];
         tmp1 = (tmp1 * b1) + ((1 - b1) * grad); 
@@ -610,11 +615,11 @@ __global__ void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T 
 template<typename T>
 void sgd(T* w, T* delta, T* in, T learning_factor, uint32_t w_y, uint32_t w_x, uint32_t batch_size) {
     uint32_t s = w_x * w_y * batch_size;
-    sgd<T><<<(s+31u)/32u , 32)>>>(w, delta, in, -learning_factor/batch_size, w_y, w_x, batch_size)
+    sgd<T><<<(s + 31u) / 32u, 32>>>(w, delta, in, -learning_factor / batch_size, w_y, w_x, batch_size);
 }
 
 template<typename T>
-void adam(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
+void adam_launcher(T* w, T* delta, T* in, T* mom1, T* mom2, T neg_lr, T b1, T b2, T e, uint32_t w_y, uint32_t w_x, uint32_t batch_size, uint32_t t) {
     uint32_t s = w_x * w_y * batch_size;
     adam<T><<<(s+31u)/32u, 32>>>(w, delta, in, mom1, mom2, neg_lr, b1, b2, e, w_y, w_x, batch_size, t);
 }

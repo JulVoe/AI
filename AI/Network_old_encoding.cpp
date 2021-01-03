@@ -1,6 +1,4 @@
-//#define THE_VERSION_JULIAN_DID_NOT_SCREW_WITH
-#define _WIN32
-
+﻿//#define THE_VERSION_JULIAN_DID_NOT_SCREW_WITH
 #ifdef __NVCC__
 #pragma warning( disable : 4514)
 #pragma warning( disable : 4711)
@@ -16,9 +14,11 @@
 #include "device_launch_parameters.h"
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
-
+#include <curand_kernel.h>
 //#include <mma.h>
 //#include <cublasXt.h>
+
+#include <cmath>
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -26,92 +26,7 @@
 #include <vector>
 
 #include "util.cpp"
-
-//Quick fix: TODO/FIXIT: Remove this
-#define EXTENDED_CONSTEXPR
-#define CPP20_CONSTEXPR
-
-#if defined(_MSC_VER)                        //For Host side compilation
-namespace cooperative_groups {};
-#define hexp(a) a
-#define hlog(a) a
-#define atomicAdd(a,b) (*a)+=b;
-#include "kernel.cu"
-#endif
-
-
-#define protected public
-#define private public
-#if 0
-    #include <cmath>
-    enum DIVISIBILITY { UNKNOWN = -1, DIVISIBLE = 1, NOT_DIVISIBLE = 2 };
-    #define atomicAdd(a,b) (*a)+=b;
-    template<typename T>
-    __device__ T exponential(T in) {
-        __builtin_unreachable();
-    }
-    template<> __device__ float  exponential<float>(float in) {
-        return expf(in);
-    }
-    template<> __device__ double exponential<double>(double in) {
-        return exp(in);
-    }
-    template<typename T>
-    __device__ T logarithm(T in) {
-        __builtin_unreachable();
-    }
-    template<> __device__ float  logarithm<float>(float in) {
-        return logf(in);
-    }
-    template<> __device__ double logarithm<double>(double in) {
-        return log(in);
-    }
-    template<typename T> struct var4 { T a, b, c, d; };
-    template<typename T, typename F>
-    __global__ void transform(T* in, uint32_t n, F f) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
-            var4<T> val = reinterpret_cast<var4<T>*>(in)[i];
-            val.a = f(val.a);
-            val.b = f(val.b);
-            val.c = f(val.c);
-            val.d = f(val.d);
-            reinterpret_cast<var4<T>*>(in)[i] = val;
-        }
-        int i = idx + n / 4 * 4;
-        if (i < n)
-            in[i] = f(in[i]);
-    }
-    
-    template<typename T, DIVISIBILITY N_divisible_blocksize>
-    __global__ void set_repeating(T* out, T* in, uint32_t n_out, uint32_t n_in) {
-        bool div_;
-        if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN)
-            div_ = ((n_out % blockDim.x) == 0);
-
-        for (uint32_t i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
-            i < n_out;
-            i += blockDim.x * 2 * gridDim.x)
-        {
-            out[i] = in[i % n_in];
-
-            if constexpr (N_divisible_blocksize == DIVISIBILITY::DIVISIBLE)
-                out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
-            if constexpr (N_divisible_blocksize == DIVISIBILITY::NOT_DIVISIBLE) {
-                if (i + blockDim.x < n_out)
-                    out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
-            }
-            if constexpr (N_divisible_blocksize == DIVISIBILITY::UNKNOWN) {
-                if (div_ || i + blockDim.x < n_out) //Compiler will automaticly eliminate lopp-independet condition N_divisible_blocksize_
-                    out[i + blockDim.x] = in[(i + blockDim.x) % n_in];
-            }
-        }
-    }
-    template<typename T, bool b>
-    extern void set_random(T* in, uint32_t s1, uint32_t s2 = 1);
-
-    #define protected public
-#endif
+#include "Dataset.cpp"
 
 /*
 Notation conventions:
@@ -161,6 +76,7 @@ There is no real documentation of how cuda graphs work. This is what I found out
 */
 
 //TODO: Softmax kernel (needed as a combination of transform/reduce operation would lead to a dynamic amount of calls)
+//TODO: Loss
 //TODO: Destructors
 //TODO: Adam. Layer types
 //TODO: Learn activation parameters
@@ -173,14 +89,21 @@ There is no real documentation of how cuda graphs work. This is what I found out
 //TODO: Change batchSize in Scheduler, get Input_Layer from every layer, NetworkBuilder takes argument whether first layer is the dataset or not
 //TODO: Check launch parameters and smem
 //TODO: Check comments, move files
+//TODO: Put methods in classes
 //TODO: CASH COHERENCE
 
 //=========================================================
 //==================|HELPER FUNCTIONS|=====================
 //=========================================================
 
-#define LAUNCH_PARAM(N) max(1, (int)(1. / (10. / ((double)(1 << 13)) + 32. / ((double)(N))))), 32
-#define GRID_SIZE(N) max(1, (int)(1. / (10. / ((double)(1 << 13)) + 32. / ((double)(N))))), 1, 1
+#define LAUNCH_PARAM(N) (int)(1. / ((10. / ((double)(1 << 13)) + 32. / ((double)(N))))), 32
+#define GRID_SIZE(N) (int)(1. / ((10. / ((double)(1 << 13)) + 32. / ((double)(N))))), 1, 1
+
+//================================================
+//==================|GLOBALS|=====================
+//================================================
+
+cublasHandle_t cublas_handle;
 
 //========================================================================
 //==================|Move to classes and kernell.cpp|=====================
@@ -209,18 +132,18 @@ inline cudaGraph_t getMatmulGraph(T* A, T* B, T* C, uint32_t y1, uint32_t x1, ui
         
         //1.: Start stream capture
         cudaGraph_t capGraph;
-        cudaStreamBeginCapture(captureStream, cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal);
+        cudaStreamBeginCapture(captureStream, cudaStreamCaptureModeThreadLocal);
         
         //2.: Enqueue cublas kernel
         if constexpr (std::is_same<T, float>::value)
-            cublasSgemm( cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, cublasConst.f[1], (float*) A, trans_A?x1:y1, (float*) B, trans_B?x2:x1, cublasConst.f[!overwrite], (float*)C, y1);
+            cublasSgemm( cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, (float*) &cublasConst[1], (float*) A, trans_A?x1:y1, (float*) B, trans_B?x2:x1, (float*)&cublasConst[!overwrite], (float*)C, y1);
         if constexpr (std::is_same<T, double>::value)
-            cublasDgemm( cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, cublasConst.d[1], (double*)A, trans_A?x1:y1, (double*)B, trans_B?x2:x1, cublasConst.d[!overwrite], (double*)C, y1);
+            cublasDgemm( cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, (double*)&cublasConst[1], (double*)A, trans_A?x1:y1, (double*)B, trans_B?x2:x1, (double*)&cublasConst[!overwrite], (double*)C, y1);
         if constexpr (std::is_same<T, half>::value)
-            cublasGemmEx(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, cublasConst.h[1], (half*)  A, CUDA_R_16F, trans_A?x1:y1, (half*)B, CUDA_R_16F, trans_B?x2:x1, cublasConst.h[!overwrite], (half*)C, CUDA_R_16F, y1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            cublasGemmEx(cublas_handle, trans_A?CUBLAS_OP_T:CUBLAS_OP_N, trans_B?CUBLAS_OP_T:CUBLAS_OP_N, y1, x2, x1, (half*)  &cublasConst[1], (half*)  A, CUDA_R_16F, trans_A?x1:y1, (half*)B, CUDA_R_16F, trans_B?x2:x1, (half*)&cublasConst[!overwrite], (half*)C, CUDA_R_16F, y1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     
         //3.: Stop capture and return graph
-        cudaStreamEndCapture(captureStream, &capGraph);
+        cudaStreamEndCapture(captureStream, capGraph);
         return capGraph;
 }
 
@@ -235,24 +158,124 @@ inline cudaGraph_t getMatmulGraphIndirection(T** A, T** B, T** C, uint32_t y1, u
 
     //1.: Start stream capture
     cudaGraph_t capGraph;
-    cudaStreamBeginCapture(captureStream, cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal);
+    cudaStreamBeginCapture(captureStream, cudaStreamCaptureModeThreadLocal);
 
     //2.: Enqueue cublas kernel
     if constexpr (std::is_same<T, float>::value)
-        cublasSgemmBatched (cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, y1, x2, x1, cublasConst.f[1], (float**)A, trans_A ? x1 : y1, (float**)B, trans_B ? x2 : x1, cublasConst.f[!overwrite], (float**)C, y1, 1);
+        cublasSgemmBatched(cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, y1, x2, x1, (float*)&cublasConst[1], (float**)A, trans_A ? x1 : y1, (float**)B, trans_B ? x2 : x1, (float*)&cublasConst[!overwrite], (float**)C, y1, 1);
     if constexpr (std::is_same<T, double>::value)
-        cublasDgemmBatched (cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, y1, x2, x1, cublasConst.d[1], (double**)A, trans_A ? x1 : y1, (double**)B, trans_B ? x2 : x1, cublasConst.d[!overwrite], (double**)C, y1, 1);
+        cublasDgemmBatched(cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, y1, x2, x1, (double*)&cublasConst[1], (double**)A, trans_A ? x1 : y1, (double**)B, trans_B ? x2 : x1, (double*)&cublasConst[!overwrite], (double**)C, y1, 1);
     if constexpr (std::is_same<T, half>::value)
-        cublasGemmBatchedEx(cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, (int)y1, (int)x2, (int)x1, (void*)cublasConst.h[1], (void**)A, CUDA_R_16F, trans_A ? x1 : y1, (void**)B, CUDA_R_16F, trans_B ? x2 : x1, (void*)cublasConst.h[!overwrite], (void**)C, CUDA_R_16F, (int)y1, 1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublasGemmBatchedEx(cublas_handle, trans_A ? CUBLAS_OP_T : CUBLAS_OP_N, trans_B ? CUBLAS_OP_T : CUBLAS_OP_N, y1, x2, x1, (half*)&cublasConst[1], (half**)A, CUDA_R_16F, trans_A ? x1 : y1, (half**)B, CUDA_R_16F, trans_B ? x2 : x1, (half*)&cublasConst[!overwrite], (half**)C, CUDA_R_16F, y1, 1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     //3.: Stop capture and return graph
-    cudaStreamEndCapture(captureStream, &capGraph);
+    cudaStreamEndCapture(captureStream, capGraph);
     return capGraph;
 }
 
 template<typename T>
+inline void addBiasNode(cudaGraph_t graph, T* out, T* in, uint32_t num_out, uint32_t num_in, cudaGraphNode_t* node){
+    void* biasArgs[] = {
+        (void*)& out,
+        (void*)& in, 
+        (void*)& num_out,
+        (void*)& num_in
+    };
+    cudaKernelNodeParams biasParam {
+        (void*)set_repeating<T>,              //Function pointer
+        dim3(GRID_SIZE(num_out)),             //Grid dimensions
+        dim3(32, 1, 1),                       //Block dimensions
+        0u,                                   //Dyn. shared-mem per block in bytes
+        (void**)&biasArgs,                    //Array of pointers to individual kernel arguments
+        nullptr                               //Pointer to kernel arguments in the "extra" format
+    };
+    cudaGraphAddKernelNode(node, graph, nullptr, 0, &biasParam);
+}
+
+template<typename T>
+inline void addActivationNode(cudaGraph_t graph, T* mem, uint32_t outStateSize, uint32_t batch_size, Activation<T> act, cudaGraphNode_t* node){
+    if (act == Activation::RELU){
+        constexpr auto ldb = []__device__(T in) { return in > (T)0 ? in : (T)0; };
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
+        
+        void* reluArgs[] = {
+            (void*)& mem,
+            (void*)& outStateSizeBatched, 
+            (void*)& ldb
+        };
+        cudaKernelNodeParams reluParam {
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
+            dim3(32, 1, 1),                       //Block dimensions
+            0u,                                   //Dyn. shared-mem per block in bytes
+            (void**)&reluArgs,                    //Array of pointers to individual kernel arguments
+            nullptr                               //Pointer to kernel arguments in the "extra" format
+        };
+        cudaGraphAddKernelNode(node, graph, nullptr, 0, &reluParam);
+    }
+    else if(act == Activation::SOFTMAX){
+        const T temp = (T)1;
+        void* softmaxArgs[] = {
+            (void*)& mem,
+            (void*)& outStateSize, 
+            (void*)& batch_size,
+            (void*)& temp
+        };
+        cudaKernelNodeParams softmaxParam {
+            (void*)softmaxTemperature<T>,         //Function pointer
+            dim3(GRID_SIZE(outStateSize)),        //Grid dimensions
+            dim3(32, 1, 1),                       //Block dimensions
+            sizeof(T),                            //Dyn. shared-mem per block in bytes
+            (void**)&softmaxArgs,                 //Array of pointers to individual kernel arguments
+            nullptr                               //Pointer to kernel arguments in the "extra" format
+        };
+        cudaGraphAddKernelNode(node, graph, nullptr, 0, &softmaxParam);
+    }
+    else if(act == Activation::SIGMOID) {
+        constexpr auto ldb = []__device__(T in) { return (T)1 / ((T)1 + exponential<T>(in)); };
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
+        
+        void* sigmoidArgs[] = {
+            (void*)& mem,
+            (void*)& outStateSizeBatched, 
+            (void*)& ldb
+        };
+        cudaKernelNodeParams sigmoidParam {
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
+            dim3(32, 1, 1),                       //Block dimensions
+            0u,                                   //Dyn. shared-mem per block in bytes */
+            (void**)&sigmoidArgs,                 //Array of pointers to individual kernel arguments
+            nullptr                               //Pointer to kernel arguments in the "extra" format
+        };
+        cudaGraphAddKernelNode(node, graph, nullptr, 0, &sigmoidParam);
+    }
+    else if(act == Activation::SOFTPLUS) {
+        constexpr auto ldb = []__device__(T in) { return logarithm<T>((T)1 + exponential<T>(in)); };
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
+        
+        void* softplusdArgs[] = {
+            (void*)& mem,
+            (void*)& outStateSizeBatched, 
+            (void*)& ldb
+        };
+        cudaKernelNodeParams softPlusdParam {
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
+            dim3(32, 1, 1),                       //Block dimensions
+            0u,                                   //Dyn. shared-mem per block in bytes */
+            (void**)&softplusdArgs,               //Array of pointers to individual kernel arguments
+            nullptr                               //Pointer to kernel arguments in the "extra" format
+        };
+        cudaGraphAddKernelNode(node, graph, nullptr, 0, &softplusParam);
+    } else {
+        fprintf(stderr, "[ERROR] Unable to add activation function to cuda graph as it is unkown!\n");
+    }
+}
+
+template<typename T>
 inline void addElementwiseMultNode(cudaGraph_t graph, T* A, T* B, uint32_t len, cudaGraphNode_t& node){
-    EXTENDED_CONSTEXPR auto ldb = []__device__(T a, T b) EXTENDED_CONSTEXPR -> T { return a * b; };
+    constexpr auto ldb = []__device__(T a, T b) { return a * b; };
     
     void* elemMultArgs[] = {
         (void*)& A,
@@ -261,7 +284,7 @@ inline void addElementwiseMultNode(cudaGraph_t graph, T* A, T* B, uint32_t len, 
         (void*)& ldb
     };
     cudaKernelNodeParams elemMultParam {
-        (void*)&transform2<T, decltype(ldb)>,  //Function pointer
+        (void*)transform<T, decltype(ldb)>,   //Function pointer
         dim3(GRID_SIZE(len)),                 //Grid dimensions
         dim3(32, 1, 1),                       //Block dimensions
         0u,                                   //Dyn. shared-mem per block in bytes
@@ -303,8 +326,8 @@ __global__ void transform_indirection(T* in1, T** in2_, uint32_t n, F f) {
     T* in2 = *in2_;
 
     for (int i = idx; i < n / 4; i += blockDim.x * gridDim.x) {
-        var4<T> val1 = reinterpret_cast<var4<T>*>(in1)[i];
-        var4<T> val2 = reinterpret_cast<var4<T>*>(in2)[i];
+        var4<T> val = reinterpret_cast<var4<T>*>(in1)[i];
+        var4<T> val = reinterpret_cast<var4<T>*>(in2)[i];
         val1.a = f(val1.a, val2.a);
         val1.b = f(val1.b, val2.b);
         val1.c = f(val1.c, val2.c);
@@ -390,7 +413,7 @@ __global__ void sgdMul(T* weigths, T* delta, T* in, L* lrate, uint32_t w_y, uint
         int y = idx % w_y;
         int x = idx / w_y;
 
-        atomicAdd(&weigths[y + x * w_y], -*lrate * in[b * w_x + x] * delta[b * w_y + y]);
+        atomicAdd(&weigths[y + x * w_y], -*lrate * in[b * w_x + x] * delta[b * w_y + y]]));
     } //index of "weigths" is "idx", compiler will optimize it away
 }
 
@@ -403,7 +426,7 @@ __global__ void sgdSimple(T* weigths, T* delta, L* lrate, uint32_t w_y, uint32_t
         int b = idx % batch_size;
         idx /= batch_size;
 
-        atomicAdd(&weigths[idx], -*lrate * delta[b * w_y + idx]);
+        atomicAdd(&weigths[idx], -*lrate * delta[b * w_y + idx]]));
     } //index of "weigths" is "idx", compiler will optimize it away
 }
 
@@ -412,7 +435,7 @@ __global__ void sgdSimple(T* weigths, T* delta, L* lrate, uint32_t w_y, uint32_t
 //===================================================
 
 enum OPTIMIZER_TYPE: uint32_t {SGD=0, ADAM=1};   //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
-template<typename T, typename L = T>             //T is type of data, L is type of learning rates
+template<typename T, typename L = T>              //T is type of data, L is type of learning rates
 class Optimizer {
 protected:
     uint64_t optimizables;                        //Number of T's this optimizer optimizes
@@ -426,10 +449,7 @@ protected:
         @param optBuf_req: Out parameter. The number of bytes on the gpu needed to store the optimization buffer (momentum, ...)
         @param lRates_req: Out parameter. The number of bytes on the gpu needed to store the learning rates (also momentum decay, ...)
     */
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& optBuf_req, MemoryRequirement& lRates_req) {
-        fprintf(stderr, "[ERROR] You called \"getOwnMemoryRequirements\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void getOwnMemoryRequirements(MemoryRequirement& optBuf_req, MemoryRequirement lRates_req);
 
 public:
     /*
@@ -444,16 +464,14 @@ public:
     /*
         Updates the member variable "optimizables" 
     */
-    void setNumOptimizables(uint64_t num_optimizables) { 
-        optimizables = num_optimizables; 
-    }
+    void setNumOptimizables(uint64_t num_optimizables) { optimizables = num_optimizables; }
 
     /*
         Returns the aggregated memory requirements of this optimizer to the given variables.
 
         @param other_requirement: Out parameter. The number of "other" bytes on the gpu needed for this optimizer
     */
-    CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement) {
+    void getMemoryRequirements(MemoryRequirement& other_requirement) {
         MemoryRequirement optBuf_req, lRates_req;
         getOwnMemoryRequirements(optBuf_req, lRates_req);
 
@@ -468,7 +486,7 @@ public:
     */
     void setMem(uint8_t*& mem) {
         //1.: Get memory requirements
-        MemoryRequirement buffer_requirement, lrates_requirement;
+        MemoryRequirement other_requirement, lrates_requirement;
         getOwnMemoryRequirements(buffer_requirement, lrates_requirement);
 
         //2.: Set "optBuf"
@@ -478,16 +496,13 @@ public:
 
         //3.: Set "learningRates"
         mem = align_pointer_unsafe(mem, lrates_requirement.alignment);
-        learningRates = (L*)mem;
+        learningRates = (L*)learningRates;
         mem += lrates_requirement.num_bytes;
     }
     /*
         Initializes the optimization buffer
     */
-    virtual void initMem() {
-        fprintf(stderr, "[ERROR] You called \"initMem\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void initMem();
     
     /*
         Adds a node that optimizes a weights matrix multiplication to a graph.
@@ -496,7 +511,7 @@ public:
 
         @param mem       : The memory that should be optimized (of the weights in this case). Matrix of shape y*x
         @param index     : The first element of "mem" is the index-ed value that this optimizer optimizes (used as a index to "optBuf"). Will be updated
-        @param delta     : The delta of the output of this layer before acitivation to the loss. Vector of length y.              =delta o_n
+        @param delta     : The delta of the output of this layer before acitivation to the loss. Vector of length y.              =Δo_n
         @param input     : The output of the layer before. Vector of length x.                                                    =layerBefore->state
         @param y         : The y-dimension of "mem"                                                                               =height weights
         @param x         : The x-dimension of "mem"                                                                               =width weights
@@ -506,10 +521,7 @@ public:
         @param depDelta  : The dependencies on "delta". Will be updated
         @param depInput  : The dependencies on "input". Will be updated
     */
-    virtual void addNodeWeights(T* mem, uint64_t& index, T* delta, T* input, uint32_t y, uint32_t x, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta, Dependencies& depInput) {
-        fprintf(stderr, "[ERROR] You called \"addNodeWeights\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void addNodeWeights(T* mem, uint64_t& index, T* delta, T* input, uint32_t y, uint32_t x, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta, Dependencies& depInput);
     /*
         Adds a node that optimizes a bias addition to a graph.
         (Optimizes vector "mem" of lenght y. Gradient is repective element of "delta", another vector of lenght "y".)
@@ -517,17 +529,14 @@ public:
 
         @param mem       : The memory that should be optimized (of the bias in this case). Vector of length y
         @param index     : The first element of "mem" is the index-ed value that this optimizer optimizes (used as a index to "optBuf"). Will be updated
-        @param delta     : The delta of the output of this layer before acitivation to the loss. Vector of length y               =delta o_n
+        @param delta     : The delta of the output of this layer before acitivation to the loss. Vector of length y               =Δo_n
         @param y         : The length of "mem"                                                                                    =number of biases (in b_n)
         @param batch_size: The used batch size
         @param graph     : The graph the optimization node should be added to
         @param depMem    : The dependencies on "mem". Will be updated
         @param depDelta  : The dependencies on "delta". Will be updated
     */
-    virtual void addNodeBias(T* mem, uint64_t& index, T* delta, uint32_t y, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta) {
-        fprintf(stderr, "[ERROR] You called \"addNodeBias\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void addNodeBias(T* mem, uint64_t& index, T* delta, uint32_t y, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta);
     
     /*
         Sets learning rates. If some of the learning rates aren't actually used, the parameter is just ignored.
@@ -537,25 +546,31 @@ public:
         @param beta2 : The second order momentum decay to use. Host pointer created by "cudaMallocHost"
         @param stream: The stream to use when copying the previous parameters to the gpu
     */
-    virtual void setLR(L* alpha, L* beta1, L* beta2, cudaStream_t stream) {
-        fprintf(stderr, "[ERROR] You called \"setLR\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void setLR(L* alpha, L* beta1, L* beta2, cudaStream_t stream);
 
     /*
         Returns the sublcass of the optimizer.
     */
-    virtual CPP20_CONSTEXPR OPTIMIZER_TYPE getOptimizerType() {
-        fprintf(stderr, "[ERROR] You called \"getOptimizerType\" on the optimizer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual static OPTIMIZER_TYPE getOptimizerType();
     /*
         Constructs an optimizer of a specific subclass at a specific memory location
 
         @param ot : The derived class of the optimizer to create
         @param out: The memory location where the optimizer should be created
     */
-    static Optimizer<T, L>* getOptimizerOfType(OPTIMIZER_TYPE ot);
+    static void getOptimizerOfType(OPTIMIZER_TYPE ot, Optimizer<T>* out) {
+        switch (ot) {
+        case OPTIMIZER_TYPE::SGD:
+            new (out) SGD_Optimizer<T>();
+            break;
+        case OPTIMIZER_TYPE::ADAM:
+            new (out) Adam_Optimizer<T>();
+            break;
+        default:
+            fprintf(stderr, "[ERROR] %llu is not a known optimizer type!", (uint64_t)ot);
+            exit(-1);
+        }
+    }
 
     // /+=============+\
     // ||SERIALIZATION||
@@ -585,29 +600,29 @@ public:
     /*
         Deserialization according to deserialization rules
     */
-    static Optimizer<T, L>* deserialize(FILE* file) {
+    static void deserialize(FILE* file, Optimizer<T, L>* out) {
         //1.: Create correct derived class
         OPTIMIZER_TYPE optimizer_type;
         fread(&optimizer_type, sizeof(OPTIMIZER_TYPE), 1, file);
-        Optimizer<T, L>* ret = Optimizer<T, L>::getOptimizerOfType(optimizer_type);
+        Optimizer<T, L>::getOptimizerOfType(optimizer_type, out);
 
         //2.: Read in variables
-        fread(&ret->optimizables, sizeof(ret->optimizables), 1, file);
+        fread(out->optimizables, sizeof(out->optimizables), 1, file);
 
         //3.: Get memory requirements
         MemoryRequirement buffer_requirement, lrates_requirement;
-        ret->getOwnMemoryRequirement(buffer_requirement, lrates_requirement);
+        out->getOwnMemoryRequirement(buffer_requirement, lrates_requirement);
 
         //4.: Read in memory
         uint64_t buffer_bytes, lrates_bytes;
 
         fread(&buffer_bytes, sizeof(buffer_bytes), 1, file);
-        cudaMallocAligned(&ret->optBuf, buffer_requirement);
-        fread(ret->optBuf, 1, buffer_bytes, file);
+        cudaMallocAligned(&out->optBuf, buffer_requirement);
+        fread(out->optBuf, 1, buffer_bytes, file);
 
         fread(&lrates_bytes, sizeof(lrates_bytes), 1, file);
-        cudaMallocAligned(&ret->learningRates, lrates_requirement);
-        fread(ret->learningRates, 1, lrates_bytes, file);
+        cudaMallocAligned(&out->learningRates, lrates_requirement);
+        fread(out->learningRates, 1, lrates_bytes, file);
 
         //5.: Check consistency
         if (buffer_requirement.num_bytes != buffer_bytes) {
@@ -618,9 +633,6 @@ public:
             fprintf(stderr, "[ERROR] Trying to create a optimizer of type %llu with %llu other bytes, even though it requires %llu", (uint64_t)optimizer_type, (uint64_t)lrates_bytes, (uint64_t)lrates_requirement.num_bytes);
             exit(-1);
         }
-
-        //6.: Return
-        return ret;
     }
 
     /*
@@ -655,10 +667,10 @@ public:
     /*
         Inverse of "compress<false>"
     */
-    static Optimizer<T, L>* getOptimizerFromCompression(FILE* file) {
+    static void getOptimizerFromCompression(FILE* file, Layer<T>* out) {
         OPTIMIZER_TYPE ot;
         fread(&ot, sizeof(OPTIMIZER_TYPE), 1, file);
-        return getOptimizerOfType(ot);
+        getOptimizerOfType(ot, out);
     }
     /*
         Inverse of "compress<true>"
@@ -680,8 +692,8 @@ template<typename T, typename L = T>
 class SGD_Optimizer : public Optimizer<T, L> {
     //learningRates = {alpha}
 protected:
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& optBuf_req, MemoryRequirement& lRates_req) override {
-        optBuf_req = MemoryRequirement();                        //No memory needed
+    virtual void getOwnMemoryRequirements(MemoryRequirement& optBuf_req, MemoryRequirement lRates_req) override {
+        optBuf_Req = MemoryRequirement(0ull, 1u);                //No memory needed
         lRates_req = MemoryRequirement(sizeof(L), alignof(L));   //alpha
     }
 
@@ -690,12 +702,12 @@ public:
     
     virtual void initMem() override {}     //No memory to initializes
 
-    virtual CPP20_CONSTEXPR OPTIMIZER_TYPE getOptimizerType() override {
+    virtual static OPTIMIZER_TYPE getOptimizerType() override {
         return OPTIMIZER_TYPE::SGD;
     }
     
     virtual void setLR(L* alpha, L* beta1, L* beta2, cudaStream_t stream) override {
-        gpuErrchk(cudaMemcpyAsync(this->learningRates, alpha, sizeof(L), cudaMemcpyHostToDevice, stream));  //SGD only uses alpha
+        cudaMemcpyAsync(learningRates, alpha, sizeof(L), cudaMemcpyHostToDevice, stream);  //SGD only uses alpha
     }
 
     virtual void addNodeWeights(T* mem, uint64_t& index, T* delta, T* input, uint32_t y, uint32_t x, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta, Dependencies& depInput) override {
@@ -709,10 +721,10 @@ public:
             (void*)&mem,
             (void*)&delta,
             (void*)&input,
-            (void*)&this->learningRates,
-            (void*)&y,
-            (void*)&x,
-            (void*)&batch_size
+            (void*)&learningRates,
+            (void*)y,
+            (void*)x,
+            (void*)batch_size
         };
         cudaKernelNodeParams sgdParam{
             (void*)sgdMul<T, L>,                  //Function pointer
@@ -723,68 +735,12 @@ public:
             nullptr                               //Pointer to kernel arguments in the "extra" format
         };
         cudaGraphAddKernelNode(&node, graph, nullptr, 0, &sgdParam);
-        depMem.apply<true>(graph, node);
-        depDelta.apply<false>(graph, node);
+        depsMem.apply<true>(graph, node);
+        depsDelta.apply<false>(graph, node);
         depInput.apply<false>(graph, node);
     }
 
     virtual void addNodeBias(T* mem, uint64_t& index, T* delta, uint32_t y, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta) override {
-        //1.: Variables used
-        uint32_t outStateSizeBatched = y * batch_size;
-
-        cudaGraphNode_t node;
-
-        //2.: Add node to graph
-        void* sgdArgs[] = {
-            (void*)&mem,
-            (void*)&delta,
-            (void*)&this->learningRates,
-            (void*)&y,
-            (void*)&batch_size
-        };
-        cudaKernelNodeParams sgdParam{
-            (void*)sgdSimple<T, L>,               //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
-            dim3(32, 1, 1),                       //Block dimensions
-            0u,                                   //Dyn. shared-mem per block in bytes
-            (void**)&sgdArgs,                     //Array of pointers to individual kernel arguments
-            nullptr                               //Pointer to kernel arguments in the "extra" format
-        };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &sgdParam);
-        depMem.apply<true>(graph, node);
-        depDelta.apply<false>(graph, node);
-    }
-};
-
-//TODO
-template<typename T, typename L = T>
-class Adam_Optimizer : public Optimizer<T, L> {
-    //learningRates = {alpha, beta1, beta2}
-protected:
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& optBuf_req, MemoryRequirement& lRates_req) override {
-        //TODO
-    }
-
-public:
-    Adam_Optimizer() = default;
-
-    virtual void initMem() override {
-        //TODO
-    }
-
-    virtual CPP20_CONSTEXPR OPTIMIZER_TYPE getOptimizerType() override {
-        return OPTIMIZER_TYPE::ADAM;
-    }
-
-    virtual void setLR(L* alpha, L* beta1, L* beta2, cudaStream_t stream) override {
-        cudaMemcpyAsync(this->learningRates + 0, alpha, sizeof(L), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(this->learningRates + 1, beta1, sizeof(L), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(this->learningRates + 2, beta2, sizeof(L), cudaMemcpyHostToDevice, stream);
-    }
-
-    virtual void addNodeWeights(T* mem, uint64_t& index, T* delta, T* input, uint32_t y, uint32_t x, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta, Dependencies& depInput) override {
-        //TODO
-        
         //1.: Variables used
         uint32_t outStateSizeBatched = x * y * batch_size;
 
@@ -794,41 +750,9 @@ public:
         void* sgdArgs[] = {
             (void*)&mem,
             (void*)&delta,
-            (void*)&input,
-            (void*)&this->learningRates,
-            (void*)&y,
-            (void*)&x,
-            (void*)&batch_size
-        };
-        cudaKernelNodeParams sgdParam{
-            (void*)sgdMul<T, L>,                  //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
-            dim3(32, 1, 1),                       //Block dimensions
-            0u,                                   //Dyn. shared-mem per block in bytes
-            (void**)&sgdArgs,                     //Array of pointers to individual kernel arguments
-            nullptr                               //Pointer to kernel arguments in the "extra" format
-        };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &sgdParam);
-        depMem.apply<true>(graph, node);
-        depDelta.apply<false>(graph, node);
-        depInput.apply<false>(graph, node);
-    }
-
-    virtual void addNodeBias(T* mem, uint64_t& index, T* delta, uint32_t y, uint32_t batch_size, cudaGraph_t graph, Dependencies& depMem, Dependencies& depDelta) override {
-        //TODO
-        
-        //1.: Variables used
-        uint32_t outStateSizeBatched = y * batch_size;
-
-        cudaGraphNode_t node;
-
-        //2.: Add node to graph
-        void* sgdArgs[] = {
-            (void*)&mem,
-            (void*)&delta,
-            (void*)&this->learningRates,
-            (void*)&y,
-            (void*)&batch_size
+            (void*)&learningRates,
+            (void*)y,
+            (void*)batch_size
         };
         cudaKernelNodeParams sgdParam{
             (void*)sgdSimple<T, L>,               //Function pointer
@@ -839,302 +763,8 @@ public:
             nullptr                               //Pointer to kernel arguments in the "extra" format
         };
         cudaGraphAddKernelNode(&node, graph, nullptr, 0, &sgdParam);
-        depMem.apply<true>(graph, node);
-        depDelta.apply<false>(graph, node);
-    }
-};
-
-
-
-template<typename T, typename L>
-static Optimizer<T, L>* Optimizer<T, L>::getOptimizerOfType(OPTIMIZER_TYPE ot) {
-    switch (ot) {
-    case OPTIMIZER_TYPE::SGD:
-        return new SGD_Optimizer<T, L>();
-    case OPTIMIZER_TYPE::ADAM:
-        return new Adam_Optimizer<T, L>();
-    default:
-        fprintf(stderr, "[ERROR] %llu is not a known optimizer type!", (uint64_t)ot);
-        exit(-1);
-    }
-}
-
-//==========================================
-//==================|Loss|==================
-//==========================================
-
-enum LOSS_TYPE : uint32_t {MSE=0, MAE=1, CROSS_ENTROPY=2};
-template<typename T, typename L = T>
-class Loss {
-protected:
-    T* guess;                  //Device pointer (to outState of last layer)
-    Image_Shape outStateShape; //Per sample
-    uint32_t batch_size;       //Number of samples per batch
-
-    T** target;                //Indirection pointer (to gpu tile)
-    T* accumulator;            //Accumulates loss
-
-public:
-    Loss() = default;
-    Loss(T* guess, Image_Shape outStateShape, uint32_t batch_size) :
-        guess(guess),
-        outStateShape(outStateShape),
-        batch_size(batch_size)
-    {
-        cudaMalloc((void**)&target, sizeof(T*));
-        cudaMalloc(&accumulator, sizeof(T));
-    }
-    void setParameters(T* guess_, Image_Shape outStateShape_, uint32_t batch_size_) {
-        guess = guess_;
-        outStateShape = outStateShape_;
-        batch_size = batch_size_;
-
-        cudaMalloc((void**)&target, sizeof(T*));
-        cudaMalloc(&accumulator, sizeof(T));
-    }
-
-    /*
-        Set the pointer to the gpu tile to a specified pointer.
-
-        @param host_indirectionPointer: Must be a pointer allocated by "cudaMallocHost" that points to a pointer on the host that points to the correct gpu tile
-        @param stream: The stream used for the memory transfer
-    */
-    void setTarget(T** host_indirection_pointer, cudaStream_t stream) {
-        gpuErrchk(cudaMemcpyAsync(target, host_indirection_pointer, sizeof(T*), cudaMemcpyHostToDevice, stream));
-    }
-
-    /*
-        Sets value of "accumulator" to zero
-
-        @param stream: The stream used for the memory transfer
-    */
-    void clearAccumulator(cudaStream_t stream) {
-        cudaMemsetAsync(accumulator, 0, sizeof(T), stream);
-    }
-    /*
-        Returns the value of the accumulator to a host variable
-
-        @param out   : Host pointer. Must have been allocated by "cudaMallocHost". The location where the value of accumulator will be written
-        @param stream: The stream used for the memroy transfer
-    */
-    void getAccumulator(T* out, cudaStream_t stream) {
-        cudaMemcpyAsync(out, accumulator, sizeof(T), cudaMemcpyDeviceToHost, stream);
-    }
-
-    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
-        fprintf(stderr, "[ERROR] You called \"getLossGraph\" on the loss base class. You should only use the derived classes!");
-        exit(-1);
-    }
-    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
-        fprintf(stderr, "[ERROR] You called \"getDeltaGraph\" on the loss base class. You should only use the derived classes!");
-        exit(-1);
-    }
-};
-
-template<typename T, typename L = T>
-class MSE_Loss : public Loss<T, L> {
-public:
-    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t lossGraph;
-        cudaGraphCreate(&lossGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR -> T { return (in1 - in2) * (in1 - in2) / (T)2; };
-
-        void* lossArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&accumulator,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams lossParams{
-            (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBILITY::DIVISIBLE, false>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
-            dim3(32, 1, 1),                                                                                              //Block dimensions
-            0u,                                                                                                          //Dyn. shared-mem per block in bytes
-            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
-            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
-        };
-        if (outStateSizeBatched % 32)
-            lossParams.func = (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBILITY::NOT_DIVISIBLE, false>;
-        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
-
-        //3.: Return
-        return lossGraph;
-    }
-
-    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t deltaGraph;
-        cudaGraphCreate(&deltaGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR -> T{ return in1 - in2; };
-
-        void* deltaArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams deltaParams{
-            (void*)&transform_indirection<T, decltype(ldb)>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
-            dim3(32, 1, 1),                                 //Block dimensions
-            0u,                                             //Dyn. shared-mem per block in bytes
-            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
-            nullptr                                         //Pointer to kernel arguments in the "extra" format
-        };
-        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
-
-        //3.: Return
-        return deltaGraph;
-    }
-};
-
-template<typename T, typename L = T>
-class MAE_Loss : public Loss<T, L> {
-public:
-    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t lossGraph;
-        cudaGraphCreate(&lossGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR-> T { return abs(in1 - in2); };
-
-        void* lossArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&accumulator,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams lossParams{
-            (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBILITY::DIVISIBLE, false>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
-            dim3(32, 1, 1),                                                                                              //Block dimensions
-            0u,                                                                                                          //Dyn. shared-mem per block in bytes
-            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
-            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
-        };
-        if (outStateSizeBatched % 32)
-            lossParams.func = (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBILITY::NOT_DIVISIBLE, false>;
-        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
-
-        //3.: Return
-        return lossGraph;
-    }
-
-    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t deltaGraph;
-        cudaGraphCreate(&deltaGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR -> T { return sign(in1 - in2); };
-
-        void* deltaArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams deltaParams{
-            (void*)&transform_indirection<T, decltype(ldb)>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
-            dim3(32, 1, 1),                                 //Block dimensions
-            0u,                                             //Dyn. shared-mem per block in bytes
-            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
-            nullptr                                         //Pointer to kernel arguments in the "extra" format
-        };
-        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
-
-        //3.: Return
-        return deltaGraph;
-    }
-};
-
-template<typename T, typename L = T>
-class CrossEntropy_Loss : public Loss<T, L> {
-public:
-    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t lossGraph;
-        cudaGraphCreate(&lossGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR -> T { return in2 * logarithm<T>(in1); };
-
-        void* lossArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&accumulator,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams lossParams{
-            (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBILITY::DIVISIBLE, false>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
-            dim3(32, 1, 1),                                                                                              //Block dimensions
-            0u,                                                                                                          //Dyn. shared-mem per block in bytes
-            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
-            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
-        };
-        if (outStateSizeBatched % 32)
-            lossParams.func = (void*)&transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBILITY::NOT_DIVISIBLE, false>;
-        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
-
-        //3.: Return
-        return lossGraph;
-    }
-
-    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
-        //1.: Create graph
-        cudaGraph_t deltaGraph;
-        cudaGraphCreate(&deltaGraph, 0);
-
-        //2.: Add node
-        cudaGraphNode_t node;
-
-        uint32_t outStateSizeBatched = outStateShape.prod() * batch_size;
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in1, T in2) EXTENDED_CONSTEXPR -> T { return in2 / in1; };
-
-        void* deltaArgs[] = {
-            (void*)&guess,
-            (void*)&target,
-            (void*)&outStateSizeBatched,
-            (void*)&ldb
-        };
-        cudaKernelNodeParams deltaParams{
-            (void*)&transform_indirection<T, decltype(ldb)>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
-            dim3(32, 1, 1),                                 //Block dimensions
-            0u,                                             //Dyn. shared-mem per block in bytes
-            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
-            nullptr                                         //Pointer to kernel arguments in the "extra" format
-        };
-        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
-
-        //3.: Return
-        return deltaGraph;
+        depsMem.apply<true>(graph, node);
+        depsDelta.apply<false>(graph, node);
     }
 };
 
@@ -1177,10 +807,7 @@ public:
         @param other_requirement: Out parameter. The number of bytes on the gpu needed to store "params" (softmax temperature, ...)
         @param tmp_requirement  : Out parameter. The number of bytes on the gpu needed to for temporary storage (accumulator for softmax, ...)
     */
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) {
-        fprintf(stderr, "[ERROR] You called \"getMemoryRequirements\" on the activation base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement);
     /*
         Sets the internal memory pointers of the actiavtion. The passed pointer will be set to the first byte after the by this activation used memory
         region. The pointers do not need to be aligned as first they will be padded so they satisfy the alignment requirement and then incrementen by the 
@@ -1192,14 +819,14 @@ public:
     */
     void setMem(uint8_t*& param_memory) {
         //1.: Get memory requirements
-        MemoryRequirement other_requirement, tmp_requirement;
-        getMemoryRequirements(other_requirement, tmp_requirement);
+        MemoryRequirement other_requirement;
+        getMemoryRequirement(other_requirement);
 
         //2.: Add padding to create alignment
         param_memory = align_pointer_unsafe(param_memory, other_requirement.alignment);
 
         //3.: Set internal variables
-        params = (T*)param_memory;
+        params = param_memory;
 
         //4.: Increment parameters
         param_memory += other_requirement.num_bytes;
@@ -1207,10 +834,7 @@ public:
     /*
         Initializes the memory pointed to by "params"
     */
-    virtual void initMem() {
-        fprintf(stderr, "[ERROR] You called \"initMem\" on the activation base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void initMem();
 
     /*
         Adds a graph node to a graph that performs forward propagation through this activation.
@@ -1221,10 +845,7 @@ public:
         @param depsMem     : The dependencies on "mem". Will be updated
         @param captureStream: The stream used to capture cublas operations
     */
-    virtual void addActivationNode     (T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) {
-        fprintf(stderr, "[ERROR] You called \"addActivationNode\" on the activation base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void addActivationNode     (T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream);
     /*
         Adds nodes to a graph that compute the derivative of the loss with respect to the input of the activation (backpropagation)
 
@@ -1238,25 +859,46 @@ public:
         @param depsDeltas   : The dependencies on "deltas". Wil be updated
         @param captureStream: The stream used to capture cublas operations
     */
-    virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) {
-        fprintf(stderr, "[ERROR] You called \"addActivationDerivNode\" on the activation base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream);
     
     /*
         Returns the type of this activation
     */
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() {
-        fprintf(stderr, "[ERROR] You called \"getActivationType\" on the activation base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual ACTIVATION_TYPE getActivationType();
     /*
         Creates an activation of the given derived class at a specific memory location.
 
         @param at:  The derived class to create
         @param out: The memory location the object should be created at
     */
-    static Activation<T>* getActivationOfType(ACTIVATION_TYPE at);
+    static void getActivationOfType(ACTIVATION_TYPE at, Activation<T>* out) { //TODO
+        switch (at) {
+        case ACTIVATION_TYPE::IDENTITY:
+            new (out) IDENTITY_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::RELU:
+            new (out) RELU_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::SOFTMAX:
+            new (out) Softmax_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::SOFTMAX_TEMP:
+            new (out) SoftmaxTemp_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::SIGMOID:
+            new (out) Sigmoid_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::TANH:
+            new (out) Tanh_Activation<T>();
+            break;
+        case ACTIVATION_TYPE::SOFTPLUS:
+            new (out) Softplus_Activation<T>();
+            break;
+        default:
+            fprintf(stderr, "[ERROR] %llu is not a known activation type!", (uint64_t)at);
+            exit(-1);
+        }
+    }
 
     // /+=============+\
     // ||SERIALIZATION||
@@ -1278,46 +920,43 @@ public:
         fwrite(&batch_size  , sizeof(batch_size  ), 1, file);
 
         //3.: Write memory
-        MemoryRequirement other_req, tmp_req;
-        getMemoryRequirements(other_req, tmp_req);
+        MemoryRequirement other_requirement;
+        getMemoryRequirement(other_requirement);
 
-        fwrite(&other_req.num_bytes, sizeof(other_req.num_bytes), 1, file);
-        fwrite(params, 1, other_req.num_bytes, file);
+        fwrite(&other_requirement.num_bytes, sizeof(other_requirement.num_bytes), 1, file);
+        fwrite(params, 1, other_requirement.num_bytes, file);
     }
     /*
         Deserializes an object from a FILE* that was serialized using the "serialize" method.
         The deserialize method should be called from the base class. It reads the activation type first and afterwards invokes the "deserialize"
         method of the corresponding derived class.
     */
-    static Activation<T>* deserialize(FILE* file) {
+    static void deserialize(FILE* file, Activation<T>* out) {
         //1.: Create correct derived class
         ACTIVATION_TYPE activation_type;
         fread(&activation_type, sizeof(ACTIVATION_TYPE), 1, file);
-        Activation<T>* ret = Activation<T>::getActivationOfType(activation_type);
+        Activation>T>::getActivationOfType(activation_type, out);
 
         //2.: Get memory requirements
-        MemoryRequirement other_req, tmp_req;
-        ret->getMemoryRequirements(other_req, tmp_req);
+        MemoryRequirement other_requirement;
+        out->getMemoryRequirement(other_requirement);
 
         //3.: Read in variables
-        fread(&ret->outStateSize, sizeof(outStateSize), 1, file);
-        fread(&ret->batch_size  , sizeof(batch_size), 1, file);
+        fread(&outStateSize, sizeof(outStateSize), 1, file);
+        fread(&batch_size, sizeof(batch_size), 1, file);
 
         //4.: Read in memory
         uint64_t other_bytes;
 
         fread(&other_bytes, sizeof(other_bytes), 1, file);
-        cudaMallocAligned(&ret->params, other_requirement);
-        fread(ret->params, 1, other_bytes, file);
+        cudaMallocAligned(&out->params, other_requirement);
+        fread(out->params, 1, other_bytes, file);
 
         //5.: Check consistency
         if (other_requirement.num_bytes != other_bytes) {
             fprintf(stderr, "[ERROR] Trying to create a activation of type %llu with %llu other bytes, even though it requires %llu", (uint64_t)activation_type, (uint64_t)other_bytes, (uint64_t)other_requirement.num_bytes);
             exit(-1);
         }
-
-        //6.: Return
-        return ret;
     }
 
     /*
@@ -1353,17 +992,18 @@ public:
     /*
         Inverse of "compress<false>"
     */
-    static Activation<T>* getActivationFromCompression(FILE* file) {
+    static void getActivationFromCompression(FILE* file, Layer<T>* out) {
         ACTIVATION_TYPE at;
         fread(&at, sizeof(ACTIVATION_TYPE), 1, file);
-        return getActivationOfType(at);
+        getActivationOfType(at, out);
     }
     /*
         Inverse of "compress<true>"
     */
     void initMemFromCompression(FILE* file) {
         MemoryRequirement other_req, tmp_req;
-        getMemoryRequirements(other_req, tmp_req);
+        uint64_t nodes;
+        getMemoryRequirements(other_req, tmp_req, nodes);
 
         void* ram_buffer;
         cudaMallocHost(&ram_buffer, other_req.num_bytes);
@@ -1381,11 +1021,11 @@ public:
     IDENTITY_Activation() = default;   //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::IDENTITY;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
         other_requirement = MemoryRequirement(0ull, 1u);  //No memory needed
         tmp_requirement   = MemoryRequirement(0ull, 1u);  //No memory needed
     }
@@ -1404,11 +1044,11 @@ public:
     RELU_Activation() = default;   //For "getActivationOfType" and user
     
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::RELU;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
         other_requirement =  MemoryRequirement(0ull, 1u);  //No memory needed
         tmp_requirement   =  MemoryRequirement(0ull, 1u);  //No memory needed
     }
@@ -1417,19 +1057,19 @@ public:
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables used
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //2.: Add node to graph
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return in > (T)0 ? in : (T)0; };
+        constexpr auto ldb = []__device__(T in) { return in > (T)0 ? in : (T)0; };
         void* reluArgs[] = {
             (void*)&mem,
             (void*)&outStateSizeBatched,
             (void*)&ldb
         };
         cudaKernelNodeParams reluParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1443,12 +1083,12 @@ public:
     //TODO: Can be fused into one kernel
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //0: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
         
         //1.: Calculate derivatives of output of activation with respect to input of activation
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return in > (T)0 ? (T)1 : (T)0; };
+        constexpr auto ldb = []__device__(T in) { return in > (T)0 ? (T)1 : (T)0; };
 
         void* reluArgs[] = {
             (void*)&mem,
@@ -1456,7 +1096,7 @@ public:
             (void*)&ldb
         };
         cudaKernelNodeParams reluParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1475,39 +1115,38 @@ public:
 
 template<typename T>
 class Softmax_Activation : public Activation<T> {
-public:
     //1.: Constructors
     Softmax_Activation() = default; //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::SOFTMAX;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
-        other_requirement = MemoryRequirement(sizeof(T), alignof(T));                                           //Need to store one T for temperature
-        tmp_requirement   = MemoryRequirement(this->batch_size * this->outStateSize * this->outStateSize, 16u); //For backprop
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+        other_requirement = MemoryRequirement(sizeof(T), alignof(T));                         //Need to store one T for temperature
+        tmp_requirement   = MemoryRequirement(batch_size * outStateSize * outStateSize, 16u); //For backprop
     }
 
     virtual void initMem() override {
         //Initialize temperature to 1
         T temp = (T)1;
-        cudaMemcpy(this->params, &temp, sizeof(T), cudaMemcpyHostToDevice);
+        cudaMemcpy(params, &temp, sizeof(T), cudaMemcpyHostToDevice);
     }
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
         
         //2.: Kernell
         void* softmaxArgs[] = {
             (void*)&mem,
-            (void*)&this->outStateSize,
-            (void*)&this->batch_size
+            (void*)&outStateSize,
+            (void*)&batch_size
         };
-        cudaKernelNodeParams softmaxParams{
+        cudaKernelNodeParams softmaxArgs{
             (void*)softmax<T, true>,                 //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)),    //Grid dimensions
             dim3(32, 1, 1),                          //Block dimensions
@@ -1515,13 +1154,13 @@ public:
             (void**)softmaxArgs,                     //Array of pointers to individual kernel arguments
             nullptr                                  //Extra
         };        
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxParams);
+        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxArgs);
         depsMem.apply<true>(graph, node);
     }
 
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //1.: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
         Dependencies depsTmp;
 
         cudaGraphNode_t node;
@@ -1532,10 +1171,10 @@ public:
         void* softmaxArgs[] = {
             (void*)&mem,
             (void*)&tmp,
-            (void*)&this->outStateSize,
-            (void*)&this->batch_size
+            (void*)&outStateSize,
+            (void*)&batch_size
         };
-        cudaKernelNodeParams softmaxParams{
+        cudaKernelNodeParams softmaxArgs{
             (void*)softmax_deriv<T, true>,           //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)),    //Grid dimensions
             dim3(32, 1, 1),                          //Block dimensions
@@ -1543,12 +1182,12 @@ public:
             (void**)softmaxArgs,                     //Array of pointers to individual kernel arguments
             nullptr                                  //Extra
         };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxParams);
+        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxArgs);
         depsMem.apply<false>(graph, node);
         depsTmp.apply<true> (graph, node);
 
         //3.: Multiply generated derivative matrix with deltas
-        cudaGraph_t mulGraph = getMatmulGraph<T, false, false, true>(tmp, deltas, mem, this->outStateSize, this->outStateSize, 1u, captureStream);
+        cudaGraph_t mulGraph = getMatmulGraph<T, false, false, true>(tmp, deltas, mem, outStateSize, outStateSize, 1u, captureStream);
         cudaGraphAddChildGraphNode(&node, graph, nullptr, 0, mulGraph);
 
         depsMem.apply<true> (graph, node);
@@ -1558,40 +1197,39 @@ public:
 
 template<typename T>
 class SoftmaxTemp_Activation : public Activation<T> {
-public:
     //1.: Constructors
     SoftmaxTemp_Activation() = default; //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::SOFTMAX_TEMP;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
-        other_requirement = MemoryRequirement(sizeof(T), alignof(T));                                           //Need to store one T for temperature
-        tmp_requirement   = MemoryRequirement(this->batch_size * this->outStateSize * this->outStateSize, 16u); //For backprop
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+        other_requirement = MemoryRequirement(sizeof(T), alignof(T));                         //Need to store one T for temperature
+        tmp_requirement   = MemoryRequirement(batch_size * outStateSize * outStateSize, 16u); //For backprop
     }
 
     virtual void initMem() override {
         //Initialize temperature to 1
         T temp = (T)1;
-        cudaMemcpy(this->params, &temp, sizeof(T), cudaMemcpyHostToDevice);
+        cudaMemcpy(params, &temp, sizeof(T), cudaMemcpyHostToDevice);
     }
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //2.: Kernell
         void* softmaxArgs[] = {
             (void*)&mem,
-            (void*)&this->outStateSize,
-            (void*)&this->batch_size,
-            (void*)&this->params
+            (void*)&outStateSize,
+            (void*)&batch_size
+            (void*)&params
         };
-        cudaKernelNodeParams softmaxParams{
+        cudaKernelNodeParams softmaxArgs{
             (void*)softmaxTemp<T, true>,             //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)),    //Grid dimensions
             dim3(32, 1, 1),                          //Block dimensions
@@ -1599,13 +1237,13 @@ public:
             (void**)softmaxArgs,                     //Array of pointers to individual kernel arguments
             nullptr                                  //Extra
         };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxParams);
+        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxArgs);
         depsMem.apply<true>(graph, node);
     }
 
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //1.: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
         Dependencies depsTmp;
 
         cudaGraphNode_t node;
@@ -1616,11 +1254,11 @@ public:
         void* softmaxArgs[] = {
             (void*)&mem,
             (void*)&tmp,
-            (void*)&this->outStateSize,
-            (void*)&this->batch_size,
-            (void*)&this->params
+            (void*)&outStateSize,
+            (void*)&batch_size,
+            (void*)&params
         };
-        cudaKernelNodeParams softmaxParams{
+        cudaKernelNodeParams softmaxArgs{
             (void*)softmaxTemp_deriv<T, true>,       //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)),    //Grid dimensions
             dim3(32, 1, 1),                          //Block dimensions
@@ -1628,12 +1266,12 @@ public:
             (void**)softmaxArgs,                     //Array of pointers to individual kernel arguments
             nullptr                                  //Extra
         };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxParams);
+        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softmaxArgs);
         depsMem.apply<false>(graph, node);
         depsTmp.apply<true>(graph, node);
 
         //3.: Multiply generated derivative matrix with deltas
-        cudaGraph_t mulGraph = getMatmulGraph<T, false, false, true>(tmp, deltas, mem, this->outStateSize, this->outStateSize, 1u, captureStream);
+        cudaGraph_t mulGraph = getMatmulGraph<T, false, false, true>(tmp, deltas, mem, outStateSize, outStateSize, 1u, captureStream);
         cudaGraphAddChildGraphNode(&node, graph, nullptr, 0, mulGraph);
         depsMem.apply<true>(graph, node);
         depsTmp.apply<false>(graph, node);
@@ -1642,16 +1280,15 @@ public:
 
 template<typename T>
 class Sigmoid_Activation : public Activation<T> {
-public:
     //1.: Constructors
     Sigmoid_Activation() = default; //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::SIGMOID;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
         other_requirement = MemoryRequirement(0ull, 1u); //No memory needed
         tmp_requirement   = MemoryRequirement(0ull, 1u); //For backprop
     }
@@ -1660,19 +1297,19 @@ public:
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables used
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //2.: Add node to graph
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return (T)1 / ((T)1 + exponential<T>(-in)); };
+        constexpr auto ldb = []__device__(T in) { return (T)1 / ((T)1 + exponential<T>(-in)); };
         void* sigArgs[] = {
             (void*)&mem,
             (void*)&outStateSizeBatched,
             (void*)&ldb
         };
         cudaKernelNodeParams sigParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1685,12 +1322,12 @@ public:
 
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //0: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //1.: Calculate derivatives of output of activation with respect to input of activation
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return in * ((T)1 - in); };
+        constexpr auto ldb = []__device__(T in) { return in * ((T)1 - in); };
 
         void* sigArgs[] = {
             (void*)&mem,
@@ -1698,7 +1335,7 @@ public:
             (void*)&ldb
         };
         cudaKernelNodeParams sigParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1717,16 +1354,15 @@ public:
 
 template<typename T>
 class Tanh_Activation : public Activation<T> {
-public:
     //1.: Constructors
     Tanh_Activation() = default; //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::TANH;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
         other_requirement = MemoryRequirement(0ull, 1u); //No memory needed
         tmp_requirement   = MemoryRequirement(0ull, 1u); //For backprop
     }
@@ -1735,19 +1371,19 @@ public:
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables used
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //2.: Add node to graph
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T x) EXTENDED_CONSTEXPR -> T { return (exponential<T>(x) - exponential<T>(-x)) / (exponential<T>(x) + exponential<T>(-x)); };
+        constexpr auto ldb = []__device__(T in) { return (exponential<T>(x) - exponential<T>(-x)) / (exponential<T>(x) + exponential<T>(-x)); };
         void* tanhArgs[] = {
             (void*)&mem,
             (void*)&outStateSizeBatched,
             (void*)&ldb
         };
         cudaKernelNodeParams tanhParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1760,12 +1396,12 @@ public:
 
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //0: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //1.: Calculate derivatives of output of activation with respect to input of activation
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return (T)1 - in * in; };
+        constexpr auto ldb = []__device__(T in) { return (T)1 - in * in; };
 
         void* tanhArgs[] = {
             (void*)&mem,
@@ -1773,7 +1409,7 @@ public:
             (void*)&ldb
         };
         cudaKernelNodeParams tanhParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1792,16 +1428,15 @@ public:
 
 template<typename T>
 class Softplus_Activation : public Activation<T> {
-public:
     //1.: Constructors
     Softplus_Activation() = default; //For "getActivationOfType" and user
 
     //2.: Overloaded functions
-    virtual CPP20_CONSTEXPR ACTIVATION_TYPE getActivationType() override {
+    virtual ACTIVATION_TYPE getActivationOfType() override {
         return ACTIVATION_TYPE::SOFTPLUS;
     }
 
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
+    virtual void getMemoryRequirements(MemoryRequirement& other_requirement, MemoryRequirement& tmp_requirement) override {
         other_requirement = MemoryRequirement(0ull, 1u); //No memory needed
         tmp_requirement   = MemoryRequirement(0ull, 1u); //For backprop
     }
@@ -1810,40 +1445,40 @@ public:
 
     virtual void addActivationNode(T* mem, T* tmp, cudaGraph_t graph, Dependencies& depsMem, cudaStream_t captureStream) override {
         //1.: Variables used
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
-
-        cudaGraphNode_t node;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         //2.: Add node to graph
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return logarithm<T>((T)1 + exponential<T>(in)); };
+        constexpr auto ldb = []__device__(T in) { return logarithm<T>((T)1 + exponential<T>(in)); };
         void* softplusArgs[] = {
             (void*)&mem,
             (void*)&outStateSizeBatched,
             (void*)&ldb
         };
         cudaKernelNodeParams softplusParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
             (void**)&softplusArgs,                //Array of pointers to individual kernel arguments
             nullptr                               //Pointer to kernel arguments in the "extra" format
         };
-        cudaGraphAddKernelNode(&node, graph, nullptr, 0, &softplusParam);
-        depsMem.apply<true>(graph, node);
+        cudaGraphAddKernelNode(out_node, graph, nullptr, 0, &softplusParam);
+        depsMem.apply<true>(graph, out_node);
+
+        out_node++;
 
         //3.: Set out parameters     
-        //depsMem reamains depsMem and thus remains the same.
+        //depsMem reamains depsMem and thus remains the same. out_node was also already incremented
     }
 
     virtual void addActivationDerivNode(T* mem, T* deltas, T* tmp, cudaGraph_t graph, Dependencies& depsMem, Dependencies& depsDeltas, cudaStream_t captureStream) override {
         //0: Variables
-        uint32_t outStateSizeBatched = this->outStateSize * this->batch_size;
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         cudaGraphNode_t node;
 
         //1.: Calculate derivatives of output of activation with respect to input of activation
-        EXTENDED_CONSTEXPR auto ldb = []__device__(T in) EXTENDED_CONSTEXPR -> T { return (T)1 - exponential<T>(-in); };
+        constexpr auto ldb = []__device__(T in) { return (T)1 - exponential<T>(-in); };
 
         void* softplusArgs[] = {
             (void*)&mem,
@@ -1851,7 +1486,7 @@ public:
             (void*)&ldb
         };
         cudaKernelNodeParams softplusParam{
-            (void*)&transform<T, decltype(ldb)>,   //Function pointer
+            (void*)transform<T, decltype(ldb)>,   //Function pointer
             dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
             dim3(32, 1, 1),                       //Block dimensions
             0u,                                   //Dyn. shared-mem per block in bytes
@@ -1862,47 +1497,21 @@ public:
         depsMem.apply<true>(graph, node);
 
         //2.: Calculate derivatives of loss with respect to the input of the activation
-        addElementwiseMultNode<T>(graph, (T*)mem, (T*)deltas, outStateSizeBatched, node);
+        addElementwiseMultNode(graph, mem, deltas, outStateSizeBatched, node);
         depsMem.apply<true>(graph, node);
         depsDeltas.apply<false>(graph, node);
     }
 };
 
-
-
-template<typename T>
-static Activation<T>* Activation<T>::getActivationOfType(ACTIVATION_TYPE at) {
-    switch (at) {
-    case ACTIVATION_TYPE::IDENTITY:
-        return new IDENTITY_Activation<T>();
-    case ACTIVATION_TYPE::RELU:
-        return new RELU_Activation<T>();
-    case ACTIVATION_TYPE::SOFTMAX:
-        return new Softmax_Activation<T>();
-    case ACTIVATION_TYPE::SOFTMAX_TEMP:
-        return new SoftmaxTemp_Activation<T>();
-    case ACTIVATION_TYPE::SIGMOID:
-        return new Sigmoid_Activation<T>();
-    case ACTIVATION_TYPE::TANH:
-        return new Tanh_Activation<T>();
-    case ACTIVATION_TYPE::SOFTPLUS:
-        return new Softplus_Activation<T>();
-    default:
-        fprintf(stderr, "[ERROR] %llu is not a known activation type!", (uint64_t)at);
-        exit(-1);
-    }
-}
-
 //============================================
 //==================|Layers|==================
 //============================================
 
-template<typename T, typename L> class Scheduler; //Needed to declare friendship
-
-enum LAYER_TYPE: uint32_t {INPT=0, FULLY_CONNECTED=1, CNN=2, RNN=3, LSTM=4, TRANSFORMER=5, POOL=6};  //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
+enum LAYER_TYPE: uint32_t {INPUT=0, FULLY_CONNECTED=1, CNN=2, RNN=3, LSTM=4, TRANSFORMER=5, POOL=6};  //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
 template<typename T, typename L = T>
 class Layer {
     friend Scheduler<T, L>;
+    friend Loss<T, L>;
 
     /*
         A layer is a helper class that does not actually own any memory. It is only used by the NetworkBuilder to construct
@@ -1915,10 +1524,10 @@ class Layer {
         Each derived class is only allowed to have "trivial" constructor and shall suppy a consdtructor without arguments.
     */
 protected:
-    Layer<T, L>* layerBefore;     //Pointer to the layer before this one. If this is the first layer, this has to be "nullptr"
-    uint32_t     batch_size;      //Number of smaples in a batch
+    Layer<T, L>* layerBefore;        //Pointer to the layer before this one. If this is the first layer, this has to be "nullptr"
+    uint32_t  batch_size;         //Number of smaples in a batch
 
-    Activation<T>* act;           //The activation of this layer
+    Activation<T> act;            //The activation of this layer
 
     Image_Shape outStateShape;    //Shape of one output sample
     void* state;                  //State of this layer (everything dependend on batch size). Starts with output state consisting of outStateShape.prod()*batch_size T's, rest can correspond to internal state.
@@ -1932,10 +1541,7 @@ protected:
         @param optimizables      : Out parameter. The number of T's   on the gpu that need to be optimized (weights, biases, ...)
         @param tmp_requirement   : Out parameter. The number of bytes on the gpu needed as temporary storage (shared between all layers and activation, non persistent)
     */ 
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) {
-        fprintf(stderr, "[ERROR] You called \"getOwnMemoryRequirements\" on the layer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual constexpr static void getOwnMemoryRequirement(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement)
 
 public:
     /*
@@ -1952,19 +1558,14 @@ public:
     /*
         Sets the variable holding a pointer to the layer right in front of this one in the network.
     */
-    void setLayerBefore(Layer<T, L>* l) { 
-        layerBefore = l; 
-    }
+    void setLayerBefore(Layer<T>* l) { layerBefore = l; }
     /*
         Sets the batch size used by this layer. Note, that this does not reallocate state memory.
         This also passes the information on to "act".
 
         @param batch_size_: The new batch size.
     */
-    void setBatchSize(uint32_t batch_size_) { 
-        batch_size = batch_size_; 
-        act->setSizes(outStateShape.prod(), batch_size); 
-    }
+    void setBatchSize(uint32_t batch_size_) { batch_size = batch_size_; act.setSizes(outStateShape.prod(), batch_size); }
     /*
         Returns the memory requirements of this layer including the activation to the given variables.
 
@@ -1973,17 +1574,18 @@ public:
         @param optimizables      : Out parameter. The number of T's   on the gpu that need to be optimized (weights, biases, ...)
         @param tmp_requirement   : Out parameter. The number of bytes on the gpu needed as temporary storage (shared between all layers and activation, non persistent)
     */
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) {
+    virtual constexpr static void getMemoryRequirement(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) {
         //1.: Own requirements
-        getOwnMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        getOwnMemoryRequirement(state_requirement, other_requirement, optimizables, tmp_requirement);
 
 
         //2.: Requirements of activation
         MemoryRequirement other_req_activ, tmp_req_activ;
-        act->getMemoryRequirements(other_req_activ, tmp_req_activ);
+        uint32_t nodes_activ;
+        act.getMemoryRequirements(other_req_activ, tmp_req_activ, nodes_activ);
 
-        other_requirement += other_req_activ;
-        tmp_requirement    = max(tmp_requirement, tmp_req_activ);
+        other_nums      += other_req_activ;
+        tmp_requirements = max(tmp_requirements, tmp_req_activ);
     }
     /*
         Sets the internal memory pointers of the layer and activation. The passed pointer will be set to the first byte after the used memory region.
@@ -1997,8 +1599,8 @@ public:
         //1.: This layer
         //1.1: Get memory requirements
         MemoryRequirement state_requirement, other_requirement, tmp_requirement;
-        uint64_t optimizables;
-        getMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        uint64_t optimizables, num_nodes;
+        getMemoryRequirement(state_requirement, other_requirement, optimizables, tmp_requirement, num_nodes);
         
         //1.2.: Add padding to create alignment
         state_mem = align_pointer_unsafe(state_mem, state_requirement.alignment);
@@ -2009,21 +1611,18 @@ public:
         other = other_mem;
 
         //1.4.: Increment parameters
-        state_mem += state_requirement.num_bytes;
-        other_mem += other_requirement.num_bytes;
+        state += state_requirement.num_bytes;
+        other += other_requirement.num_bytes;
 
         //2.: Activation
-        act->setMem(other_mem);
+        act.setMem(other);
     }
 
     /* 
         Initializes "state" and "other" memory of the size returned in getMemoryRequirements.
         Also has to intialize memory of "act".
     */
-    virtual void initMem() {
-        fprintf(stderr, "[ERROR] You called \"initMem\" on the layer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual void initMem();
     /*
         Adds forward propagation through this layer to an execution graph. Takes in the state of the layer before and computes own state.
         Returns indirection pointers (the layer after the input cannot use the input layer's state directly, as it changes) and the number of them.
@@ -2037,10 +1636,7 @@ public:
         @param tmp          : Temporary storage of at least the size and alignment requested in "getMemoryRequirements".
         @param after_dataset: True, when this layer is the first layer after the input layer that refers to the dataset
     */
-    virtual std::vector<T**> forwardProp(cudaGraph_t graph, Dependencies& depPrevState, cudaStream_t captureStream, T* tmp, bool after_dataset) {
-        fprintf(stderr, "[ERROR] You called \"forwardProp\" on the layer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual std::vector<T**> forwardProp(cudaGraph_t graph, Dependencies& depPrevState, cudaStream_t captureStream, T* tmp, bool after_dataset);
     /*
         Adds backpropagation through this layer to an execution graph.
         Assumes, that the state of this layer was already set to dL/do where L is Loss and o the output state after forwardProp.
@@ -2054,28 +1650,32 @@ public:
         @param tmp              : Temporary storage of at least the size and alignment requested in "getMemoryRequirements".
         @param after_dataset    : True, when this layer is the first layer after the input layer that refers to the dataset
     */
-    virtual std::vector<T**> backwardProp(cudaGraph_t graph, Dependencies& depState, Optimizer<T, L>* opt, uint64_t& optimizable_index, cudaStream_t captureStream, T* tmp, bool after_dataset) {
-        fprintf(stderr, "[ERROR] You called \"backwardProp\" on the layer base class. You should only use the derived classes!");
-        exit(-1);
-    }
+    virtual std::vector<T**> backwardProp(cudaGraph_t graph, Dependencies& depState, Optimizer<T, L>* opt, uint64_t& optimizable_index, cudaStream_t captureStream, T* tmp, bool after_dataset);
     
     /*
         Return the type of the layer.
     */
-    virtual CPP20_CONSTEXPR LAYER_TYPE getLayerType() {
-        fprintf(stderr, "[ERROR] You called \"getLayerType\" on the layer base class. You should only use the derived classes!");
-        exit(-1);
+    virtual static LAYER_TYPE getLayerType();
+    static void getLayerOfType(LAYER_TYPE lt, Layer<T>* out) {
+        switch (lt) {
+        case LAYER_TYPE::INPUT:
+            new (out) Input_Layer<T>();
+            break;
+        case LAYER_TYPE::FULLY_CONNECTED:
+            new (out) FullyConnected_Layer<T>();
+            break;
+        default:
+            fprintf(stderr, "[ERROR] %llu is not a known layer type!", (uint64_t)lt);
+            exit(-1);
+        }
     }
-    static Layer<T, L>* getLayerOfType(LAYER_TYPE lt);
     /*
         This function can be called by user to create a wanted layer. It is also used for Networks deserialization
     */
-    static Layer<T, L>* getLayerFromSpecifiers(LAYER_TYPE lt, Image_Shape shape, ACTIVATION_TYPE at) {
-        Layer<T, L>* ret = getLayerOfType(lt);
-        ret->outStateShape = shape;
-        ret->act           = Activation<T>::getActivationOfType(at);
-
-        return ret;
+    static void getLayerFromSpecifiers(LAYER_TYPE lt, Image_Size shape, ACTIVATION_TYPE at, Layer<T>* out) {
+        getLayerOfType(lt, out);
+        out->outStateShape = shape;
+        Activation<T>::getActivationOfType(at, &out->act);
     }
     
     // /+=============+\
@@ -2088,18 +1688,18 @@ public:
     void serialize(FILE* file) {
         //1.: Write layer type
         LAYER_TYPE layer_type = getLayerType();
-        fwrite(&layer_type, sizeof(LAYER_TYPE), 1, file);
+        fwrite(&layer_type, sizeof(layer_type), 1, file);
 
         //2.: Write variables
         fwrite(&layer_before, sizeof(layer_before), 1, file);
-        fwrite(&batch_size  , sizeof(batch_size  ), 1, file);
-        act->serialize(file);
+        fwrite(&batch_size  , sizeof(batch_size), 1, file);
+        act.serialize(file);
         outStateShape.serialize(file);
 
         //3.: Write memory
         MemoryRequirement state_requirement, other_requirement, tmp_requirement;
-        uint64_t optimizables;
-        getMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        uint64_t optimizables, num_nodes;
+        getMemoryRequirement(state_requirement, other_requirement, optimizables, tmp_requirement, num_nodes);
 
         fwrite(&state_requirement.num_bytes, sizeof(state_requirement.num_bytes), 1, file);
         fwrite(state, 1, state_requirement.num_bytes, file);
@@ -2110,33 +1710,33 @@ public:
     /*
         Deserialization according to deserialization rules
     */
-    static Layer<T, L>* deserialize(FILE* file) {
+    static void deserialize(FILE* file, Layer<T>* out) {
         //1.: Create correct derived class
         LAYER_TYPE layer_type;
         fread(&layer_type, sizeof(LAYER_TYPE), 1, file);
-        Layer<T, L>* ret = Layer<T>::getLayerOfType(layer_type);
+        Layer<T>::getLayerOfType(layer_type, out);
 
         //2.: Read in variables
-        fread(&ret->layer_before, sizeof(ret->layer_before), 1, file);
-        fread(&ret->batch_size  , sizeof(ret->batch_size), 1, file);
-        ret->act = Activation<T>::deserialize(file);
-        Image_Shape::deserialize(file, &ret->outStateShape);
+        fread(out->layer_before, sizeof(out->layer_before), 1, file);
+        fread(out->batch_size, sizeof(out->batch_size), 1, file);
+        Activation<T>::deserialize(file, &out->act);
+        Image_Shape::deserialize(file, &out->outStateShape);
 
         //3.: Get memory requirements
         MemoryRequirement state_requirement, other_requirement, tmp_requirement;
-        uint64_t optimizables;
-        ret->getMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        uint64_t optimizables, num_nodes;
+        out->getMemoryRequirement(state_requirement, other_requirement, optimizables, tmp_requirement, num_nodes);
 
         //4.: Read in memory
         uint64_t state_bytes, other_bytes;
 
         fread(&state_bytes, sizeof(state_bytes), 1, file);
-        cudaMallocAligned(&ret->state, state_requirement);
-        fread(ret->state, 1, state_bytes, file);
+        cudaMallocAligned(&out->state, state_requirement);
+        fread(out->state, 1, state_bytes, file);
 
         fread(&other_bytes, sizeof(other_bytes), 1, file);
-        cudaMallocAligned(&ret->other, other_requirement);
-        fread(ret->other, 1, other_bytes, file);
+        cudaMallocAligned(&out->other, other_requirement);
+        fread(out->other, 1, other_bytes, file);
 
         //5.: Check consistency
         if (state_requirement.num_bytes != state_bytes) {
@@ -2147,9 +1747,6 @@ public:
             fprintf(stderr, "[ERROR] Trying to create a layer of type %llu with %llu other bytes, even though it requires %llu", (uint64_t)layer_type, (uint64_t)other_bytes, (uint64_t)other_requirement.num_bytes);
             exit(-1);
         }
-
-        //6.: Return
-        return ret;
     }
 
     /*
@@ -2166,8 +1763,8 @@ public:
         if constexpr (data) {
             //1.: Write "other"
             MemoryRequirement state_req, other_req, tmp_req;
-            uint64_t optim;
-            getOwnMemoryRequirements(state_req, other_req, optim, tmp_req);
+            uint64_t optim, nodes;
+            getOwnMemoryRequirement(state_req, other_req, optim, tmp_req, nodes);
 
             void* ram_buffer;
             cudaMallocHost(&ram_buffer, other_req.num_bytes);
@@ -2177,7 +1774,7 @@ public:
             cudaFreeHost(ram_buffer);
 
             //2.: Compress activation
-            act->compress<true>(file);
+            act.compress<true>(file);
         }
         else {
             //1.: Write specifiers
@@ -2186,25 +1783,22 @@ public:
             fwrite(&outStateShape, sizeof(Image_Shape), 1, file);
 
             //2.: Write acitvation specifiers
-            act->compress<false>(file);
+            act.compress<false>(file);
         }
     }
     /*
         Inverse of "compress<false>"
     */
-    static Layer<T, L*> getLayerFromCompression(FILE* file) {
-        //1.: Layer specifiers
+    static void getLayerFromCompression(FILE* file, Layer<T>* out) {
+        //1.: Layer
         LAYER_TYPE lt;
-        fread(&lt, sizeof(LAYER_TYPE), 1, file);
-        Layer<T, L>* ret = getLayerOfType(lt);
+        fread(&lt           , sizeof(LAYER_TYPE ), 1, file);
+        getLayerOfType(lt, out);
 
-        fread(&ret->outStateShape, sizeof(Image_Shape), 1, file);
+        fread(&out->outStateShape, sizeof(Image_Shape), 1, file);
 
         //2.: Activation
-        ret->act = Activation<T>::getActivationFromCompression(file);
-
-        //3.: Return
-        return ret;
+        Activation<T>::getActivationFromCompression(file, &out->act);
     }
     /*
         Inverse of "compress<true>"
@@ -2212,8 +1806,8 @@ public:
     void initMemFromCompression(FILE* file) {
         //1.: Layer
         MemoryRequirement state_req, other_req, tmp_req;
-        uint64_t optim;
-        getOwnMemoryRequirements(state_req, other_req, optim, tmp_req);
+        uint64_t optim, nodes;
+        getOwnMemoryRequirement(state_req, other_req, optim, tmp_req, nodes);
 
         void* ram_buffer;
         cudaMallocHost(&ram_buffer, other_req.num_bytes);
@@ -2223,7 +1817,7 @@ public:
         cudaFreeHost(ram_buffer);
 
         //2.: Activation
-        act->initMemFromCompression(file);
+        act.initMemFromCompression(file);
     }
 };
 
@@ -2234,45 +1828,38 @@ class Input_Layer : public Layer<T, L> {
 public:
     //1.: Constructors
     //Used in "getLayerOfType"
-    Input_Layer()        
+    Input_Layer() :
+        layerBefore(nullptr),
+        batch_size(0),
+        outStateShape(Image_Shape(0, 0, 0)),
+        state(nullptr),
+        other(nullptr)
     {
-        this->layerBefore = nullptr;
-        this->batch_size = 0u;
-        
-        this ->act = Activation<T>::getActivationOfType(ACTIVATION_TYPE::IDENTITY);
-        
-        this->outStateShape = Image_Shape(0u, 0u, 0u);
-        this->state = nullptr;
-        this->other = nullptr;
+        getActivationOfType(ACTIVATION_TYPE::IDENTITY, &act);
     }
 
     //Used by user
-    Input_Layer(uint32_t num_neurons)
+    Input_Layer(uint32_t num_neurons):
+        layerBefore(nullptr),
+        batch_size(0),
+        outStateShape(Image_Shape(num_neurons, 1, 1)),
+        state(nullptr),
+        other(nullptr)
     {
-        this->layerBefore = nullptr;
-        this->batch_size = 0u;
-
-        this->act = Activation<T>::getActivationOfType(ACTIVATION_TYPE::IDENTITY);
-
-        this->outStateShape = Image_Shape(num_neurons, 1u, 1u);
-        this->state = nullptr;
-        this->other = nullptr;
+        getActivationOfType(ACTIVATION_TYPE::IDENTITY, &act);
     }
 
 protected:
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) override {
+    virtual static void getOwnMemoryRequirement(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement, uint64_t& num_nodes) override {
         state_requirement = MemoryRequirement(sizeof(T*), 1u);   //Points to current gpu tile
         other_requirement = MemoryRequirement(0ull      , 1u);   //No memory needed
         optimizables      = 0;                                   //No variables to optimize
         tmp_requirement   = MemoryRequirement(0ull      , 1u);   //No memory needed
+        num_nodes         = 0;                                   //No node needed
     }
 
 public:
-    virtual void initMem() override { 
-        T* cur_gpu_tile = nullptr;
-        gpuErrchk(cudaMemcpy(this->state, (void*)&cur_gpu_tile, sizeof(T*), cudaMemcpyHostToDevice)); //Write "nullptr" to state 
-        
-    }
+    virtual void initMem() override { T* cur_gpu_tile = nullptr;  cudaMemcpy(state, &cur_gpu_tile, sizeof(T*), cudaMemcpyHostToDevice); } //Write "nullptr" to state
 
     /*
         Set the pointer to the gpu tile to a specified pointer.
@@ -2281,21 +1868,21 @@ public:
         @param stream: The stream used for the memory transfer
     */
     void setInputPointer(T** host_indirectionPointer, cudaStream_t stream) {
-        cudaMemcpyAsync(this->state, host_indirectionPointer, sizeof(T*), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(state, host_indirectionPointer, sizeof(T*), cudaMemcpyHostToDevice, stream);
     }
 
-    virtual std::vector<T**> forwardProp(cudaGraph_t graph, Dependencies& depPrevState, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
+    virtual std::vector<T**> forwardProp(const cudaGraph_t& graph, Dependencies& depPrevState, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
         fprintf(stderr, "[ERROR] You are trying to compute forward pass through input layer!");
         std::exit(-1);
     }
 
-    virtual std::vector<T**> backwardProp(cudaGraph_t graph, Dependencies& depState, Optimizer<T, L>* opt, uint64_t& optimizable_index, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
+    virtual std::vector<T**> backwardProp(const cudaGraph_t& graph, Dependencies& depState, Optimizer<T, L>* opt, uint64_t& optimizable_index, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
         fprintf(stderr, "[ERROR] You are trying to compute backwards pass through input layer!");
         std::exit(-1);
     }
 
-    virtual CPP20_CONSTEXPR LAYER_TYPE getLayerType() override {
-        return LAYER_TYPE::INPT;
+    virtual static LAYER_TYPE getLayerType() override {
+        return LAYER_TYPE::INPUT;
     }
 };
 
@@ -2310,83 +1897,63 @@ public:
     //Used in "getLayerOfType":
     FullyConnected_Layer() = default;
     //Used by user:
-    FullyConnected_Layer(ACTIVATION_TYPE at  , uint32_t num_neurons)
-    {
-        this->layerBefore = nullptr;
-        this->batch_size = 0u;
-
-        this->act = Activation<T>::getActivationOfType(at);
-
-        this->outStateShape = Image_Shape(num_neurons, 1u, 1u);
-        this->state = nullptr;
-        this->other = nullptr;
-    }
-    FullyConnected_Layer(Activation<T>*  act_, uint32_t num_neurons)
-    {
-        this->layerBefore = nullptr;
-        this->batch_size = 0u;
-
-        this->act = act_;
-        
-        this->outStateShape = Image_Shape(num_neurons, 1u, 1u);
-        this->state = nullptr;
-        this->other = nullptr;
-    }
+    FullyConnected_Layer(Activation<T>& act_, uint32_t num_neurons) :    
+        layerBefore(nullptr), batch_size(0u), act(act_), outStateShape(Image_Shape(num_neurons, 1u, 1u)), state(nullptr), other(nullptr)
+    {}
 
     // /+=======+\
     // ||Methods||
     // \+=======+/
 protected:
-    virtual CPP20_CONSTEXPR void getOwnMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) override {
+    virtual constexpr static void getOwnMemoryRequirement(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) override {
         //1.: This layer
-        state_requirement = MemoryRequirement(sizeof(T) * this->outStateShape.prod() * this->batch_size, 16);              //Output of layer (cublas wants alignment of at least 16 bytes)
+        state_nums = MemoryRequirement(sizeof(T) * outStateShape.prod() * batch_size, 16);                     //Output of layer (cublas wants alignment of at least 16 bytes)
 
-        other_requirement = MemoryRequirement(
-            sizeof(T) * (uint64_t)this->outStateShape.prod() * (1ull + (uint64_t)this->layerBefore->outStateShape.prod()), //Bias + Weights
-            16);                                                                                                           //cublas wants alignment of at least 16 bytes
-                   
-        optimizables = other_requirement.num_bytes / sizeof(T);                                                            //Bias + Weights
+        other_nums = MemoryRequirement(                                                             
+            sizeof(T) * (uint64_t)outStateShape.prod() * (1ull + (uint64_t)layerBefore->outStateShape.prod()), //Bias + Weights
+            16);                                                                                               //cublas wants alignment of at least 16 bytes
+                                                                                                          
+        optimizables = other_nums.num / sizeof(T);                                                             //Bias + Weights
 
-        tmp_requirement = MemoryRequirement(sizeof(T) * this->layerBefore->outStateShape.prod() * this->batch_size, 16);   //For backprop (cublas wants alignment of at least 16 bytes)
+        tmp_requirement = MemoryRequirement(sizeof(T) * layerBefore->outStateShape.prod() * batch_size, 16);   //For backprop (cublas wants alignment of at least 16 bytes)
     }
 
 public:
-    virtual CPP20_CONSTEXPR void getMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) override {
+    virtual constexpr static void getMemoryRequirement(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) override {
         //1.: Own requirements
-        getOwnMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        getOwnMemoryRequirement(state_requirement, other_requirement, optimizables, tmp_requirement);
+
 
         //2.: Requirements of activation
         MemoryRequirement other_req_activ, tmp_req_activ;
-        this->act->getMemoryRequirements(other_req_activ, tmp_req_activ);
+        act.getMemoryRequirements(other_req_activ, tmp_req_activ);
 
-        other_requirement += other_req_activ;
-        tmp_requirement   += tmp_req_activ;                    //In backpropagation, both layer and activation use "tmp" at the same time
+        other_nums += other_req_activ;
+        tmp_requirements += tmp_req_activ;                    //In backpropagation, both layer and activation use "tmp" at the same time
     }
 
     //TODO/FIXIT: MAKE WORK AND DEPENDENT ON ACTIVATION FUNCTION
     virtual void initMem() override {
         //1.: Set memory of activation
-        this->act->initMem();
+        act.initMem();
 
         //2.: Useful variables
-        T* bias    = (T*)this->other;
-        T* weights = bias + this->outStateShape.prod();
+        T* bias    = other;
+        T* weights = bias + outStateShape.prod();
 
         //3.: Initialize "other". "state" does not initialization
-        set_random<T, true>(bias   , this->outStateShape.prod(), 1, LAUNCH_PARAM(this->outStateShape.prod()));
-        set_random<T, true>(weights, this->layerBefore->outStateShape.prod(), this->outStateShape.prod(), LAUNCH_PARAM(this->layerBefore->outStateShape.prod() * this->outStateShape.prod()));
-    
-        CHECK_CUDA_ERROR();
+        set_random<T, true>(bias   , outStateShape.prod());
+        set_random<T, true>(weights, layerBefore->outStateShape.prod(), outStateShape.prod());
     }
 
     virtual std::vector<T**> forwardProp(cudaGraph_t graph, Dependencies& depPrevState, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
         //0.: Usefuls variables
-        uint32_t outStateSize = this->outStateShape.prod();
-        uint32_t outStateSizeBatched = outStateSize * this->batch_size;
+        uint32_t outStateSize = outStateShape.prod();
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         //Split "other" pointer
-        T* bias    = (T*)this->other;
-        T* weights = bias + outStateSize;
+        T* bias    = other;
+        T* weights = bias + outStateShape.prod();
 
         //Dependencies
         Dependencies depState;
@@ -2396,52 +1963,48 @@ public:
 
         //1.: Bias
         void* biasArgs[] = {
-            (void*)&this->state,
+            (void*)&state,
             (void*)&bias,
             (void*)&outStateSizeBatched,
             (void*)&outStateSize
         };
         cudaKernelNodeParams biasParam{
-            (void*)&set_repeating<T, DIVISIBILITY::DIVISIBLE>, //Function pointer
-            dim3(GRID_SIZE(outStateSizeBatched)),               //Grid dimensions
-            dim3(32, 1, 1),                                     //Block dimensions
-            0u,                                                 //Dyn. shared-mem per block in bytes
-            (void**)&biasArgs,                                  //Array of pointers to individual kernel arguments
-            nullptr                                             //Pointer to kernel arguments in the "extra" format
+            (void*)set_repeating<T>,              //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)), //Grid dimensions
+            dim3(32, 1, 1),                       //Block dimensions
+            0u,                                   //Dyn. shared-mem per block in bytes
+            (void**)&biasArgs,                    //Array of pointers to individual kernel arguments
+            nullptr                               //Pointer to kernel arguments in the "extra" format
         };
-        if (outStateSizeBatched % 32)
-            biasParam.func = (void*)&set_repeating<T, DIVISIBILITY::NOT_DIVISIBLE>;
         cudaGraphAddKernelNode(&node, graph, nullptr, 0, &biasParam);
-            CHECK_CUDA_ERROR();
-        depState.apply<true>(graph, node);
+        depState.apply<true>(node);
         
         //2.: Weight multiplication
         std::vector<T**> indirection_pointers;
 
         cudaGraph_t multGraph;
         if (after_dataset) {
-            T** weights_gpu, **state_gpu;                                         //Pointer to device pointer to data
-            cudaMalloc((void**)&weights_gpu, sizeof(T*));                         //Each pointer holds memory for one device pointer
-            cudaMalloc((void**)&state_gpu  , sizeof(T*));                         //Each pointer holds memory for one device pointer
+            T** weights_gpu, state_gpu;                                           //Pointer to device pointer to data
+            cudaMalloc(&weights_gpu, sizeof(T*));                                 //Each pointer holds memory for one device pointer
+            cudaMalloc(&state_gpu  , sizeof(T*));                                 //Each pointer holds memory for one device pointer
                                                                                   
-            cudaMemcpy((void*)weights_gpu, &weights    , sizeof(T**), cudaMemcpyHostToDevice); //Device pointer point to data
-            cudaMemcpy((void*)state_gpu  , &this->state, sizeof(T**), cudaMemcpyHostToDevice); //Device pointer point to data
+            cudaMemcpy(weights_gpu, &weights, cudaMemcpyHostToDevice);            //Device pointer point to data
+            cudaMemcpy(state_gpu  , &state  , cudaMemcpyHostToDevice);            //Device pointer point to data
                            
             indirection_pointers.push_back(weights_gpu);
             indirection_pointers.push_back(state_gpu);
 
-            multGraph = getMatmulGraphIndirection<T, false, false, false>(weights_gpu, (T**)this->layerBefore->state, state_gpu, outStateSize, this->layerBefore->outStateShape.prod(), this->batch_size, captureStream);
+            multGraph = getMatmulGraphIndirection<T, false, false, false>(weights_gpu, (T**)layerBefore->state, state_gpu, outStateSize, layerBefore->outStateShape.prod(), batch_size, captureStream);
         }
         else {
-            multGraph = getMatmulGraph<T, false, false, false>((T*)weights, (T*)this->layerBefore->state, (T*)this->state, outStateSize, this->layerBefore->outStateShape.prod(), this->batch_size, captureStream);
+            multGraph = getMatmulGraph<T, false, false, false>((T*)weights, (T*)layerBefore->state, (T*)state, outStateSize, layerBefore->outStateShape.prod(), batch_size, captureStream);
         }
         cudaGraphAddChildGraphNode(&node, graph, nullptr, 0, multGraph);
-            CHECK_CUDA_ERROR();
         depPrevState.apply<false>(graph, node);
         depState.apply<true>(graph, node);     //This does clash with bias setting, as that is not atomic (theoreticaly bias could reset part of result of this)
-
+    
         //3.: Activation
-        this->act->addActivationNode((T*)this->state, tmp, graph, depState, captureStream); //Manages dependencies and "out_node" incrementation itself
+        act.addActivationNode(state, tmp, graph, depState, captureStream); //Manages dependencies and "out_node" incrementation itself
 
         //4.: Update parameters
         depPrevState = depState;
@@ -2452,19 +2015,20 @@ public:
 
     virtual std::vector<T**> backwardProp(cudaGraph_t graph, Dependencies& depState, Optimizer<T, L>* opt, uint64_t& optimizable_index, cudaStream_t captureStream, T* tmp, bool after_dataset) override {
         //0.: Usefull variables
-        uint32_t outStateSize = this->outStateShape.prod();
-        //uint32_t outStateSizeBatched = outStateSize * this->batch_size;
+        uint32_t outStateSize = outStateShape.prod();
+        uint32_t outStateSizeBatched = outStateSize * batch_size;
 
         //Split "other" pointer
-        T* bias    = (T*)this->other;
+        T* bias    = other;
         T* weights = bias + outStateSize;
 
         //Split "tmp" pointer. Needs alignment requirement of activation
         MemoryRequirement other_req_activ, tmp_req_activ;
-        this->act->getMemoryRequirements(other_req_activ, tmp_req_activ);
+        uint32_t nodes_activ;
+        act.getMemoryRequirements(other_req_activ, tmp_req_activ, nodes_activ);
 
         T* tmp_delta = tmp;
-        T* tmp_activ = tmp_delta + roundUpMultPow2(this->layerBefore->outStateShape.prod() * this->batch_size, tmp_req_activ.alignment);
+        T* tmp_activ = tmp_delta + roundUpMultPow2(layerBefore->outStateShape.prod() * batch_size, tmp_req_activ.alignment);
 
         //Dependencies
         Dependencies depTmp_delta, depWeights, depBias, depPrevState;
@@ -2475,51 +2039,295 @@ public:
 
         //1.: Multiply deltas backwards (tmp = w^T * deltas.)
         if (!after_dataset) {
-            cudaGraph_t multGraph = getMatmulGraph<T, true, false, true>(weights, (T*)this->state, tmp_delta, this->layerBefore->outStateShape.prod(), outStateSize, this->batch_size, captureStream);
+            cudaGraph_t multGraph = getMatmulGraph<T, true, false, true>(weights, state, tmp_delta, layerBefore->outStateShape.prod(), outStateShape.prod(), batch_size, captureStream);
             cudaGraphAddChildGraphNode(&node, graph, nullptr, 0, multGraph);
-                CHECK_CUDA_ERROR();
             depState.apply<false>(graph, node);
             depWeights.apply<false>(graph, node);
             depTmp_delta.apply<true>(graph, node);
         }
 
         //2.: Apply optimizers to weights
-        opt->addNodeWeights(weights, optimizable_index, (T*)this->state, (T*)this->layerBefore->state, outStateSize, this->layerBefore->outStateShape.prod(), this->batch_size, graph, depWeights, depState, depPrevState);
+        opt->addNodeWeights(weights, optimizable_index, state, layerBefore->state, outStateSize, layerBefore->outStateShape.prod(), batch_size, graph, depWeights, depState, depPrevState);
 
         //3.: Apply optimizer to bias
-        opt->addNodeBias(bias, optimizable_index, (T*)this->state, outStateSize, this->batch_size, graph, depBias, depState);
+        opt->addNodeBias(bias, optimizable_index, state, outStateSize, batch_size, graph, depBias, depState);
 
         //4.: Write delta of previous layer
         if (!after_dataset)
-            this->layerBefore->act->addActivationDerivNode((T*)this->layerBefore->state, tmp_delta, tmp_activ, graph, depPrevState, depTmp_delta, captureStream);
+            layerBefore->act.addActivationDerivNode(layerBefore->state, tmp_delta, tmp_activ, graph, depPrevState, depTmp_delta, captureStream);
         
 
         //5.: Update pointers
         depState = depPrevState;
-
-        //6.: Return
-        return std::vector<T**>();
     }
 
-    virtual CPP20_CONSTEXPR LAYER_TYPE getLayerType() override {
+    virtual static LAYER_TYPE getLayerType() override {
         return LAYER_TYPE::FULLY_CONNECTED;
     }
 };
 
+//==========================================
+//==================|Loss|==================
+//==========================================
 
+enum LOSS_TYPE : uint32_t { MSE, MAE, CROSS_ENTROPY };
+template<typename T, typename L = T>
+class Loss {
+protected:
+    Layer<T, L>* layer;
+    T** target;
+    T*  accumulator;
+
+public:
+    Loss(Layer<T, L>* layer = nullptr) :
+        layer(layer)
+    {
+        cudaMalloc((void**)&target, sizeof(T*));
+        cudaMalloc(&accumulator, sizeof(T));
+    }
+    
+    /*
+        Set the pointer to the gpu tile to a specified pointer.
+
+        @param host_indirectionPointer: Must be a pointer allocated by "cudaMallocHost" that points to a pointer on the host that points to the correct gpu tile
+        @param stream: The stream used for the memory transfer
+    */
+    void setTarget(T** host_indirection_pointer, cudaStream_t stream) {
+        cudaMemcpyAsync(target, host_indirection_pointer, sizeof(T*), cudaMemcpyHostToDevice, stream);
+    }
+
+    /*
+        Sets value of "accumulator" to zero
+
+        @param stream: The stream used for the memory transfer
+    */
+    void clearAccumulator(cudaStream_t stream) {
+        cudaMemsetAsync(accumulator, 0, sizeof(T), stream);
+    }
+    /*
+        Returns the value of the accumulator to a host variable
+
+        @param out   : Host pointer. Must have been allocated by "cudaMallocHost". The location where the value of accumulator will be written
+        @param stream: The stream used for the memroy transfer
+    */
+    void getAccumulator(T* out, cudaStream_t stream) {
+        cudaMemcpyAsync(out, accumulator, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    }
+
+    virtual cudaGraph_t getLossGraph (cudaStream_t cap_stream);
+    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream);
+};
 
 template<typename T, typename L>
-static Layer<T, L>* Layer<T, L>::getLayerOfType(LAYER_TYPE lt) {
-    switch (lt) {
-    case LAYER_TYPE::INPT:
-        return new Input_Layer<T, L>();
-    case LAYER_TYPE::FULLY_CONNECTED:
-        return new FullyConnected_Layer<T, L>();
-    default:
-        fprintf(stderr, "[ERROR] %llu is not a known layer type!", (uint64_t)lt);
-        exit(-1);
+class MSE_Loss : public Loss<T, L> {
+    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t lossGraph;
+        cudaGraphCreate(&lossGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+        
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return (in1 - in2) * (in1 - in2) / (T)2; };
+
+        void* lossArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&accumulator,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams lossParams{
+            (void*)transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBLE::DIVISIBLE, false>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
+            dim3(32, 1, 1),                                                                                              //Block dimensions
+            0u,                                                                                                          //Dyn. shared-mem per block in bytes
+            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
+            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
+
+        //3.: Return
+        return lossGraph;
     }
-}
+
+    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t deltaGraph;
+        cudaGraphCreate(&deltaGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return in1 - in2; };
+
+        void* deltaArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams deltaParams{
+            (void*)transform_indirection<T, decltype(ldb)>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
+            dim3(32, 1, 1),                                 //Block dimensions
+            0u,                                             //Dyn. shared-mem per block in bytes
+            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
+            nullptr                                         //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
+
+        //3.: Return
+        return deltaGraph;
+    }
+};
+
+template<typename T, typename L>
+class MAE_Loss : public Loss<T, L> {
+    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t lossGraph;
+        cudaGraphCreate(&lossGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return abs(in1 - in2); };
+
+        void* lossArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&accumulator,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams lossParams{
+            (void*)transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBLE::DIVISIBLE, false>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
+            dim3(32, 1, 1),                                                                                              //Block dimensions
+            0u,                                                                                                          //Dyn. shared-mem per block in bytes
+            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
+            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
+
+        //3.: Return
+        return lossGraph;
+    }
+
+    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t deltaGraph;
+        cudaGraphCreate(&deltaGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return sign(in1-in2); };
+
+        void* deltaArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams deltaParams{
+            (void*)transform_indirection<T, decltype(ldb)>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
+            dim3(32, 1, 1),                                 //Block dimensions
+            0u,                                             //Dyn. shared-mem per block in bytes
+            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
+            nullptr                                         //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
+
+        //3.: Return
+        return deltaGraph;
+    }
+};
+
+template<typename T, typename L>
+class CrossEntropy_Loss : public Loss<T, L> {
+    virtual cudaGraph_t getLossGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t lossGraph;
+        cudaGraphCreate(&lossGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return in2 * logarithm<T>(in1); };
+
+        void* lossArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&accumulator,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams lossParams{
+            (void*)transform_reduce_indirection<T, decltype(ldb), DIVISIBILITY::DIVISIBLE, DIVISIBLE::DIVISIBLE, false>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),                                                                        //Grid dimensions
+            dim3(32, 1, 1),                                                                                              //Block dimensions
+            0u,                                                                                                          //Dyn. shared-mem per block in bytes
+            (void**)&lossArgs,                                                                                           //Array of pointers to individual kernel arguments
+            nullptr                                                                                                      //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, lossGraph, nullptr, 0, &lossParams);
+
+        //3.: Return
+        return lossGraph;
+    }
+
+    virtual cudaGraph_t getDeltaGraph(cudaStream_t cap_stream) {
+        //1.: Create graph
+        cudaGraph_t deltaGraph;
+        cudaGraphCreate(&deltaGraph, 0);
+
+        //2.: Add node
+        cudaGraphNode_t node;
+
+        uint32_t outStateSizeBatched = layer->outStateShape.prod() * layer->batch_size;
+        constexpr auto ldb = []__device__(T in1, T in2) { return in2 / in1; };
+
+        void* deltaArgs[] = {
+            (void*)&layer->state,
+            (void*)&target,
+            (void*)&outStateSizeBatched,
+            (void*)&ldb
+        };
+        cudaKernelNodeParams deltaParams{
+            (void*)transform_indirection<T, decltype(ldb)>, //Function pointer
+            dim3(GRID_SIZE(outStateSizeBatched)),           //Grid dimensions
+            dim3(32, 1, 1),                                 //Block dimensions
+            0u,                                             //Dyn. shared-mem per block in bytes
+            (void**)&deltaArgs,                             //Array of pointers to individual kernel arguments
+            nullptr                                         //Pointer to kernel arguments in the "extra" format
+        };
+        if (outStateSizeBatched % 32)
+            lossParams.func = (void*)transform_reduce<T, decltype(ldb), DIVISIBILITY::NOT_DIVISIBLE, DIVISIBLE::NOT_DIVISIBLE, false>;
+        cudaGraphAddKernelNode(&node, deltaGraph, nullptr, 0, &deltaParams);
+
+        //3.: Return
+        return deltaGraph;
+    }
+};
+
 //================================================
 //==================|Network|=====================
 //================================================
@@ -2540,13 +2348,14 @@ class NetworkBuilder {
          - dump of "optBuf" memory for optimizer 
     */
 private:
-    std::vector<Layer<T,L>*> layers;       //Holds information on layers
+    Layer<T,L>* layers;                         //Holds information on layers
+    uint32_t num_layers;                   //The number of layers
                                            
     uint32_t mem_align;                    //Garanties that arguments of "setMem" are always aligned up to this number of bytes.
                                            
     uint32_t batch_size;                   //Numberos samples per batch
                                            
-    Optimizer<T, L>* opt;                  //Optimizer. Only information. Memory is stored at the end of "other_mem"
+    Optimizer<T, L> opt;                    //Optimizer. Only information. Memory is stored at the end of "other_mem"
                                            
     T* state_mem;                          //Has to be realloced when batch size changes.
     T* other_mem;                          //Fixed size. Also memory of optimizer.
@@ -2559,17 +2368,17 @@ private:
     */
     void getLayerMemoryRequirements(MemoryRequirement& state_requirement, MemoryRequirement& other_requirement, uint64_t& optimizables, MemoryRequirement& tmp_requirement) {
         //0.: Accumulators
-        state_requirement = MemoryRequirement();
-        other_requirement = MemoryRequirement();
+        state_requirement = MemoryRequirement(0ull, 1u);
+        other_requirement = MemoryRequirement(0ull, 1u);
         optimizables      = 0;
-        tmp_requirement   = MemoryRequirement();
+        tmp_requirement   = MemoryRequirement(0ull, 1u);
 
         //1.: Requirements of layers
-        for (uint32_t layer_index = 0; layer_index != layers.size(); layer_index++) {
+        for (uint32_t layer_index = 0; layer_index != num_layers; layer_index++) {
             MemoryRequirement s, o, t;
-            uint64_t op;
+            uint64_t op, no;
 
-            layers[layer_index]->getMemoryRequirements(s, o, op, t);
+            layers[layer_index].getMemoryRequirements(s, o, op, t, no);
 
             s.alignment = max(s.alignment, mem_align);                                           //Alignment has to be at least the minimum required alignment
             state_requirement += s;
@@ -2591,10 +2400,12 @@ public:
         2.: Get scheduler
     */
 
-    NetworkBuilder(std::vector<Layer<T, L>*> layers, uint32_t mem_align, uint32_t batch_size, OPTIMIZER_TYPE ot) :
+    NetworkBuilder(Layer<T, L>* layers, uint32_t num_layers, uint32_t mem_align, uint32_t batch_size, Optimizer<T, L> opt) :
         layers(layers),
+        num_layers(num_layers),
         mem_align(mem_align),
         batch_size(batch_size),
+        opt(opt),
         state_mem(nullptr),
         other_mem(nullptr),
         tmp_mem(nullptr),
@@ -2602,21 +2413,14 @@ public:
     {
         printf("[INFO] Creating NetworkBuilder from given layers\n");
 
-        //0.: Check arguments
-        if (layers[0]->getLayerType() != LAYER_TYPE::INPT) {
-            fprintf(stderr, "[ERROR] The first layer must be an input layer while you supplied a layer of type %u", (uint32_t)layers[0]->getLayerType());
+        if (layers[0].getLayerType() != LAYER_TYPE::INPUT) {
+            fprintf(stderr, "[ERROR] The first layer must be an input layer while you supplied a layer of type %u", (uint32_t)layers[0].getLayerType());
             exit(-1);
         }
 
         //1.: Connect the layers
-        connect();
-
-        //2.: Set batch size
-        for (uint32_t layer_index = 0; layer_index < layers.size(); layer_index++)
-            layers[layer_index]->setBatchSize(batch_size);
-
-        //2.: Construct optimizer
-        opt = Optimizer<T, L>::getOptimizerOfType(ot);
+        for(uint32_t ind = 1; ind < num_layers; ind++)
+            l[ind].setLayerBefore(&l[ind-1])
     }
     
     /*
@@ -2637,7 +2441,7 @@ public:
         
         char sig[7];
         fread(+sig, sizeof(char), 7, file);
-        if(strncmp(sig, "JVCHECK", 7) == 0)
+        if(strcmp(sig, "JVCHECK", 7) == 0)
             printf("[INFO] \t - Signature matches\n");
         else {
             printf("[Error] \t - Signature mismatch! Should be \"%s\" while the checkpoint file supplied \"%.7s\".", "JVCHECK", sig);
@@ -2665,48 +2469,38 @@ public:
         }
 
         //5.: Read in information on layers
-        uint32_t num_layers;
-        fread(&num_layers, sizeof(uint32_t), 1, file);
-        layers.reserve(num_layers);
-
+        fread(&num_layers, sizeof(num_layers), 1, file);
+        layers = (Layer<T>*)malloc(num_layers * sizeof(Layer<T>));
+        Layer<T>* layer_before = nullptr;
         for (uint32_t layer_index = 0; layer_index != num_layers; layer_index++) {
-            layers.push_back(Layer<T>::getLayerFromCompression(file));
+            Layer<T>::getLayerFromCompression(file, &layers[layer_index]);
 
-            layers.back()->setBatchSize(batch_size);
+            layers[layer_index].setLayerBefore(layer_before);
+            layers[layer_index].setBatchSize  (batch_size);
             
             //No need to set "state","other" to a specific value
+
+            layer_before = &layers[layer_index];    //Update last layer pointer
         }
 
 
-        if (layers[0]->getLayerType() != LAYER_TYPE::INPT) {
-            fprintf(stderr, "[ERROR] The first layer must be an input layer while the first saved layer is of type %u", (uint32_t)layers[0]->getLayerType());
+        if (layers[0].getLayerType() != LAYER_TYPE::INPUT) {
+            fprintf(stderr, "[ERROR] The first layer must be an input layer while the first saved layer is of type %u", (uint32_t)layers[0].getLayerType());
             exit(-1);
         }
 
         //6.: Read in information on optimizer
-        opt = Optimizer<T, L>::getOptimizerFromCompression(file);
+        Optimizer<T, L>::getOptimizerFromCompression(file, &opt);
         
         //7.: Allocate memory
         allocate();
 
         //8.: Fill memory of layers (other. state is left unitialized)
         for (uint32_t layer_index = 0; layer_index != num_layers; layer_index++)
-            layers[layer_index]->initMemFromCompression(file);
+            layers[layer_index].initMemFromCompression(file);
 
         //9.: Fill memory of optimizer
-        opt->initMemFromCompression(file);
-    }
-
-    /*
-        Connects the layers (set "layerBefore" pointers)
-    */
-    void connect() {
-        //1.: First layer
-        layers[0]->setLayerBefore(nullptr);
-
-        //2.: Other layer
-        for (uint32_t ind = 1; ind < layers.size(); ind++)
-            layers[ind]->setLayerBefore(layers[ind - 1]);
+        opt.initMemFromCompression(file);
     }
 
     /*
@@ -2719,10 +2513,10 @@ public:
         getLayerMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
 
         //2.: Get requirements of optimizer
-        opt->setNumOptimizables(optimizables);
+        opt.setNumOptimizables(optimizables);
 
         MemoryRequirement opt_other_req;
-        opt->getMemoryRequirements(opt_other_req);
+        opt.getMemoryRequirements(opt_other_req);
         opt_other_req.alignment = max(opt_other_req.alignment, mem_align);
 
         other_requirement += opt_other_req;
@@ -2730,10 +2524,10 @@ public:
         //3.: Allocation
         printf("[INFO] Trying to allocate %llumb on gpu for the network... ", (state_requirement.num_bytes + other_requirement.num_bytes + tmp_requirement.num_bytes) / (1024ull * 1024ull));
 
-        gpuErrchk(cudaMallocAligned((void**)&other_mem, other_requirement));
-        gpuErrchk(cudaMallocAligned((void**)&state_mem, state_requirement));
-        gpuErrchk(cudaMallocAligned((void**)&  tmp_mem,   tmp_requirement));
-        if(other_mem != nullptr && state_mem != nullptr && tmp_mem != nullptr)
+        gpuErrchk(cudaMallocAligned(&other_mem, state_requirement));
+        gpuErrchk(cudaMallocAligned(&state_mem, other_requirement));
+        gpuErrchk(cudaMallocAligned(&  tmp_mem,   tmp_requirement));
+        if(other_tmp_mem != nullptr && state_mem != nullptr && tmp_mem != nullptr)
             printf("Success!\n");
         else {
             printf("Failure!\n");
@@ -2741,13 +2535,13 @@ public:
         }
 
         //4.: Set pointers of layers (and activations)
-        uint8_t* state_mem_ = (uint8_t*)state_mem;
-        uint8_t* other_mem_ = (uint8_t*)other_mem;
-        for(uint32_t ind = 0; ind != layers.size(); ind++)
-            layers[ind]->setMem(state_mem_, other_mem_);
+        T* state_mem_ = state_mem;
+        T* other_mem_ = other_mem;
+        for(uint32_t ind = 0; ind != num_layers; ind++)
+            layers[ind].setMem(state_mem_, other_mem_);
 
         //5.: Set pointer of optimizer
-        opt->setMem(other_mem_);
+        opt.setMem(other_mem_);
     }
 
     /*
@@ -2755,11 +2549,11 @@ public:
     */
     void initialize(){
         //1.: Initialize layers (and activations)
-        for(uint32_t ind = 0; ind != layers.size(); ind++)
-            layers[ind]->initMem();
+        for(uint32_t ind = 0; ind != num_layers; ind++)
+            layers[ind].initMem();
 
         //2.: Initialize optimizer
-        opt->initMem();
+        opt.initMem();
     }
 
     /*
@@ -2770,13 +2564,13 @@ public:
     void resetBatchSize(uint32_t new_batchSize){
         //1.: Reset variables
         batch_size = new_batchSize;
-        for(uint32_t ind = 0; ind != layers.size(); ind++)
-            layers[ind]->setBatchSize(new_batchSize);
+        for(uint32_t ind = 0, ind != num_layers; ind++)
+            layers[ind].setBatchSize(new_batchSize);
 
         //2.: Reallocate
         MemoryRequirement state_requirement, other_requirement, tmp_requirement;
-        uint64_t optimizables;
-        getLayerMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement);
+        uint64_t optimizables, num_nodes;
+        getLayerMemoryRequirements(state_requirement, other_requirement, optimizables, tmp_requirement, num_nodes);
 
         //nothing changed for opt
         
@@ -2788,8 +2582,8 @@ public:
         //3.: Set new memory
         T* state_mem_ = state_mem;
         T* other_mem_ = other_mem;
-        for(uint32_t ind = 0; ind != layers.size(); ind++)
-            layers[ind]->setMem(state_mem_, other_mem_);
+        for(uint32_t ind = 0; ind != num_layers; ind++)
+            layers[ind].setMem(state_mem_, other_mem_);
 
         //optimizer should stay unchanged
     }
@@ -2806,12 +2600,12 @@ public:
         Dependencies depPrevState;
 
         //3.: Layer after dataset
-        std::vector<T**> indirection_pointers_forward = layers[1]->forwardProp(forwardGraph, depPrevState, recording_stream, tmp_mem, true);
+        std::vector<T**> indirection_pointers_forward = layers[1].forwardProp(forwardGraph, depPrevState, recording_stream, tmp_mem, true);
         indirection_pointers.insert(std::end(indirection_pointers), std::begin(indirection_pointers_forward), std::end(indirection_pointers_forward)); //New indirection pointers
-        
+
         //4.: Other layers
-        for (uint32_t ind = 2; ind < layers.size(); ind++)
-            layers[ind]->forwardProp(forwardGraph, depPrevState, recording_stream, tmp_mem, false);
+        for (uint32_t ind = 2; ind < num_layers; ind++)
+            layers[ind].forwardProp(forwardGraph, depPrevState, recording_stream, tmp_mem, false);
 
         //5.: Return
         return forwardGraph;
@@ -2829,12 +2623,13 @@ public:
         Dependencies depState;
 
         //3.: Other layers
+        cudaGraphNode_t* depNode = nullptr;
         uint64_t optimizable_index = 0;
-        for (uint32_t ind = layers.size() - 1; ind > 1; ind--)
-            layers[ind]->backwardProp(backwardGraph, depState, opt, optimizable_index, recording_stream, tmp_mem, false);
+        for (uint32_t ind = num_layers - 1; ind > 1; ind--)
+            layers[ind].backwardProp(backwardGraph, depState, &opt, optimizable_index, recording_stream, tmp_mem, false);
 
         //4.: Layer after dataset
-        std::vector<T**> indirection_pointers_backwards = layers[1]->backwardProp(backwardGraph, depState, opt, optimizable_index, recording_stream, tmp_mem, true);
+        std::vector<T**> indirection_pointers_backwards = layers[1].backwardProp(backwardGraph, depState, &opt, optimizable_index, recording_stream, tmp_mem, true);
         indirection_pointers.insert(std::end(indirection_pointers), std::begin(indirection_pointers_backwards), std::end(indirection_pointers_backwards)); //New indirection pointers
 
         //5.: Return
@@ -2842,8 +2637,8 @@ public:
     }
 
     void getFirstAndLastLayer(Layer<T, L>*& firstLayer, Layer<T, L>*& lastLayer) {
-        firstLayer = layers.front();
-        lastLayer  = layers.back();
+        firstLayer = &layers[0];
+        lastLayer  = &layer[num_layers - 1];
     }
 
     /*
@@ -2858,29 +2653,372 @@ public:
         uint16_t version = AI_VERSION;
         uint32_t type = type_hash<T>();
         fwrite(+signature, sizeof(signature) - 1, 1, file); //Signature
-        fwrite(&version  , sizeof(version  )    , 1, file); //Library version
-        fwrite(&type     , sizeof(type     )    , 1, file); //The underlying type
+        fwrite(&version, sizeof(version), 1, file); //Library version
+        fwrite(&type, sizeof(type), 1, file); //The underlying type
 
         //3.: Information on layers
-        uint32_t num_layers = layers.size();
-        fwrite(&num_layers, sizeof(uint32_t), 1, file);
+        fwrite(&num_layers, sizeof(num_layers), 1, file);
         for (uint32_t layer_index = 0; layer_index != num_layers; layer_index++)
-            layers[layer_index]->compress<false>(file);
+            layers[layer_index].compress<false>(file);
 
         //4.: Information on optimizer
-        opt->compress<false>(file);
+        opt.compress<false>(file);
 
         //5.: Memory of layers
         for (uint32_t layer_index = 0; layer_index != num_layers; layer_index++) 
-            layers[layer_index]->compress<true>(file);
+            layers[layer_index].compress<true>(file);
 
         //6.: Memory of optimizer
-        opt->compress<true>(file);
+        opt.compress<true>(file);
 
         //7.: Close file
         fclose(file);
     }
 };
+
+//==================================================
+//==================|Scheduler|=====================
+//==================================================
+#define PI 3.141592653589793238462643383267502884197
+enum LRSCHEDULE_TYPE : uint32_t { LINEAR, COSINE, DECAY, EXPONENTIAL, DEMON };
+template<typename L>
+struct LRSchedule {
+    L lr_sta, lr_sto;
+    uint32_t warm_restarts;
+
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs);
+    virtual LRSCHEDULE_TYPE getType();
+};
+
+template<typename L>
+struct Linear_LRSchedule : public LRSchedule<L> {
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs) override {
+        double round;
+        L frac = modf(epoch / (warm_restarts ? warm_restarts : num_epochs), &nullptr);
+
+        return lr_sta - (lr_sta - lr_sto) * frac; 
+    }
+    virtual LRSCHEDULE_TYPE getType() { return LRSCHEDULE_TYPE::LINEAR; }
+};
+
+template<typename L>
+struct Cosine_LRSchedule : public LRSchedule<L> {
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs) override {
+        double round;
+        L frac = modf(LRSchedule / (warm_restarts ? warm_restarts : num_epochs), &nullptr);
+
+        return lr_sto + (lr_sta - lr_sto) * ((L)1 + (L)cos(PI * frac)) / (L)2; 
+    }
+    virtual LRSCHEDULE_TYPE getType() { return LRSCHEDULE_TYPE::COSINE; }
+};
+
+template<typename L>
+struct Decay_LRSchedule : public LRSchedule<L> {
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs) override {
+        double round;
+        L frac = modf(epoch / (warm_restarts ? warm_restarts : num_epochs), &nullptr);
+
+        return lr_sta * (L)1 / ((L)1 + ((lr_sta / lr_sto) - (L)1) * frac);
+    }
+    virtual LRSCHEDULE_TYPE getType() { return LRSCHEDULE_TYPE::DECAY; }
+};
+
+template<typename L>
+struct Exponential_LRSchedule : public LRSchedule<T> {
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs) override {
+        double round;
+        L frac = modf(epoch / (warm_restarts ? warm_restarts : num_epochs), &nullptr);
+
+        return lr_sta * pow(lr_sto / lr_sta, frac);
+    }
+    virtual LRSCHEDULE_TYPE getType() { return LRSCHEDULE_TYPE::EXPONENTIAL; }
+};
+
+template<typename L>
+struct Demon_LRSchedule : public LRSchedule<T> {
+    virtual L getLrEpoch(uint32_t epoch, uint232_t num_epochs) override {
+        double round;
+        L frac = modf(epoch / (warm_restarts ? warm_restarts : num_epochs), &nullptr);
+
+        return (((L)1 - frac) * lr_sta) / ((L)1 - frac * lr_sta);
+    }
+    virtual LRSCHEDULE_TYPE getType() { return LRSCHEDULE_TYPE::DEMON; }
+};
+
+template<typename L>
+struct LRScheduleComplete {
+    LRSchedule<L> warmup, regular;
+    uint32_t warmup_length;
+
+    L getLrEpoch(uint32_t epoch, uint32_t num_epochs) {
+        if (epoch < warmup_length)
+            return warmup.getLrEpoch(epoch, warmup_length);
+        else
+            return regular.getLrEpoch(epoch - warmup_length, num_epochs - warmup_length);
+    }
+};
+
+template<typename T, typename L = T>
+class Scheduler{
+    //Components
+    NetworkBuilder<T, L>* network; //Also optimizer
+    Loss<T>*              loss;
+    DatasetHandler<T>*    dataset;
+
+    //Hyperparameters
+    uint32_t num_epochs;
+    uint32_t steps_per_epoch;
+
+    LRScheduleComplete<L> alpha_schedule, beta1_schedule, beta2_schedule;
+
+    uint32_t plataue_start;
+    T        plateau_threshold;
+    uint32_t patienceLRChange, patienceEarlyStopping;   //0 to disable
+    L        lrPlateauFactor;
+    L        lrAccumulatedFactor;
+
+    T        loss_goal;             //Stop early, when validation loss is under this goal
+    
+    //Execution stuff
+    cudaStream_t execStream;
+
+    //Monitoring
+    std::vector<T> alpha_history, beta1_history, beta2_history;
+    std::vector<L> loss_history;
+
+public:
+    Scheduler() = default;
+    void setNumRuns(uint32_t num_epochs_, uint32_t steps_per_epoch_) {
+        num_epochs = num_epochs_;
+        steps_per_epoch = steps_per_epoch_;
+    }
+
+    void setLRSchedule(LRScheduleComplete<L> alpha_schedule_, LRScheduleComplete<L> beta1_schedule_, LRScheduleComplete<L> beta2_schedule_) {
+        alpha_schedule = alpha_schedule_;
+        beta1_schedule = beta1_schedule_;
+        beta2_schedule = beta2_schedule_;
+    }
+
+    void setPlateau(uint32_t start, T threshold, uint32_t patienceLRChange_ = 0, L lrPlateauFactor_ = (L)0.1, uint32_t patienceEarlyStopping_ = 0) {
+        if (0 < patienceEarlyStopping && patienceEarlyStopping < patienceLRChange)
+            fprintf(stderr, "[WARNING] Early stopping will occur before the learning rate change. Thus, a learning rate change resulting of a plateau will never occur!\n");
+        
+        plateau_start         = start;
+        plateau_thresholde    = threshold;
+        patienceLRChange      = patienceLRChange_;
+        lrPlateauFactor       = lrPlateauFactor_;
+        patienceEarlyStopping = patienceEarlyStopping_;
+    }
+
+    void setLossGoal(T goal) {
+        loss_goal = goal;
+    }
+
+    void launch(uint32_t dataset_workers, uint32_t dataset_streams, bool debug_window) {
+        //0.: Test whether components match
+        Image_Shape in_shape, out_shape;
+        uint32_t training_samples, validation_samples;
+        dataset->getAugmentedShapes(in_shape, out_shape);
+        dataset->getNumSamples(training_samples, validation_samples);
+
+        Layer<T, L>* firstLayer_, * lastLayer;
+        network->getFirstAndLastLayer(firstLayer, lastLayer);
+
+        if (firstLayer->getLayerType() != LAYER_TYPE::INPUT) {
+            fprintf(stderr, "[ERROR] First layer of network has to be an input layer, yet it has type %u", firstLayer->getLayerType());
+            exit(-1);
+        }
+
+        Input_Layer<T, L>* firstLayer = firstLayer_;
+
+        if (firstLayer->outStateShape !=  in_shape) {
+            if (firstLayer->outStateShape.prod() != in_shape.prod) {
+                fprintf(stderr, "[WARNING] The input layer of the network has the right size, yet its shape(%u x %u x %u) is not the same as the sample from the dataset(%u x %u x %u)  ßn",
+                    firstLayer->outStateShape.x, firstLayer->outStateShape.y, firstLayer->outStateShape.z,
+                    in_shape.x, in_shape.y, in_shape.z
+                );
+            }
+            else {
+                fprintf(stderr, "[ERROR] The shape of the input layer(%u x %u x %u) does not match the shape of samples from the dataset(%u x %u x %u)",
+                    firstLayer->outStateShape.x, firstLayer->outStateShape.y, firstLayer->outStateShape.z,
+                    in_shape.x, in_shape.y, in_shape.z
+                );
+                exit(-1);
+            }
+        }
+        if ( lastLayer->outStateShape != out_shape) {
+            if (lastLayer->outStateShape.prod() != out_shape.prod) {
+                fprintf(stderr, "[WARNING] The last layer of the network has the right size, yet its shape(%u x %u x %u) is not the same as the sample from the dataset(%u x %u x %u)           ßn",
+                    lastLayer->outStateShape.x, lastLayer->outStateShape.y, lastLayer->outStateShape.z,
+                    out_shape.x, out_shape.y, out_shape.z
+                );
+            }
+            else {
+                fprintf(stderr, "[ERROR] The shape of the last layer(%u x %u x %u) does not match the shape of samples from the dataset(%u x %u x %u)",
+                    lastLayer->outStateShape.x, lastLayer->outStateShape.y, lastLayer->outStateShape.z,
+                    out_shape.x, out_shape.y, out_shape.z
+                );
+                exit(-1);
+            }
+        }
+
+        if (loss->layer != lastLayer)
+            fprintf(stderr, "[WARNING] The loss is computed based of the output of an intermidiate layer (pointer %p instead of %p)\n", loss->layer, lastLayer);
+        
+
+        //1.: Build graphs
+        cudaStreamCreateWithFlags(&execStream, cudaStreamNonBlocking);
+
+        cudaGraph_t trainStep, validationStep;
+        cudaGraphCreate(&trainStep, 0);
+        cudaGraphCreate(&validationStep, 0);
+        cudaGraphNode_t node, depNode;
+
+        //1.1.: trainStep
+        //Forward propagation
+        cudaGraphAddChildGraphNode(&node, trainStep, nullptr, 0, network->getForwardGraph(execStream));
+        depNode = node;
+
+        //Last Deltas
+        cudaGraphAddChildGraphNode(&node, trainStep, depNode, 1, loss->getDeltaGraph(execStream));
+        depNode = node;
+
+        //Backward propagation
+        cudaGraphAddChildGraphNode(&node, trainStep, depNode, 1, network->getBackwardsGraph(execStream));
+        depNode = node;
+
+        //1.2.: validationStep
+        //Forward propagation
+        cudaGraphAddChildGraphNode(&node, validationStep, nullptr, 0, network->getForwardGraph(execStream));
+        depNode = node;
+
+        //Compute loss
+        cudaGraphAddChildGraphNode(&node, validationStep, depNode, 1, loss->getLossGraph(execStream));
+        depNode = node;
+
+
+        //2.: Instantiate graphs
+        cudaGraphExec_t trainExec, validationExec;
+        char* errorBuf[512] = ",";
+        cudaGraphNode_t errNode;
+
+        cudaGraphInstantiate(&trainExec, trainStep, &errNode, +errorBuf, 512);
+        if (errorBuf[0] != ',') {
+            fprintf(stderr, "[ERROR] The following error arose during the instantiation of the training graph: %s", +errorBuf);
+            exit(-1);
+        }
+
+        cudaGraphInstantiate(&validationExec, validationStep, &errNode, +errorBuf, 512);
+        if (errorBuf[0] != ',') {
+            fprintf(stderr, "[ERROR] The following error arose during the instantiation of the validation graph: %s", +errorBuf);
+            exit(-1);
+        }
+
+        //3.: Run
+        //Pointer to current gpu tile
+        T** in, ** out, * loss_buf;
+        L* alpha_buf, * beta1_buf, * beta2_buf;
+        cudaMallocHost((void**)&in , sizeof(T*));
+        cudaMallocHost((void**)&out, sizeof(T*));
+        cudaMallocHost(&loss_buff, sizeof(T));
+        cudaMallocHost(&alpha_buf, sizeof(L));
+        cudaMallocHost(&beta1_buf, sizeof(L));
+        cudaMallocHost(&beta2_buf, sizeof(L));
+
+        //Start dataset workers
+        printf("[INFO] Starting dataset workers\n");
+        dataset->start_workers(dataset_workers, dataset_streams, WORKER_STATUS::TRAINING);
+
+        printf("[INFO] Starting training loop\n");
+        for (uint32_t epoch = 0; epoch != num_epochs; epoch++) {
+            //Compute LRs
+            *alpha_buf = alpha_schedule.getLrEpoch(epoch, num_epochs) * lrAccumulatedFactor;
+            *beta1_buf = beta1_schedule.getLrEpoch(epoch, num_epochs) * lrAccumulatedFactor;
+            *beta2_buf = beta2_schedule.getLrEpoch(epoch, num_epochs) * lrAccumulatedFactor;
+
+            alpha_history.append(*alpha_buf);
+            beta1_history.append(*beta1_buf);
+            beta2_history.append(*beta2_buf);
+            
+            //Set LRs
+            network->opt.setLR(alpha_buf, beta1_buf, beta2_buf, execStream);
+
+            //Training
+            for (uint32_t step = 0; step != steps_per_epoch; step++) {
+                //Set input and output
+                T* in_, *out_;
+                dataset->advance<true>(in_, out_);
+                *in  = in_;
+                *out = out_;
+
+                firstLayer->setInputPointer(in, execStream);
+                loss->setTarget(out, execStream);
+
+                cudaGraphLaunch(trainExec, execStream);
+            }
+
+            //Validation
+            for (uint32_t step = 0; step != validation_samples; step++) {
+                //Set input and output
+                T* in_, *out_;
+                dataset->advance<false>(in_, out_);
+                *in  = in_;
+                *out = out_;
+
+                firstLayer->setInputPointer(in, execStream);
+                loss->setTarget(out, execStream);
+
+                cudaGraphLaunch(validationExec, execStream);
+            }
+
+            loss->getAccumulator(loss_buff, execStream);
+            loss->clearAccumulator(execStream);
+            loss_history.push_back(*loss_buff / (T)validation_samples);
+        
+            //Debugging
+            if (debug) {
+                printf("Epoch %u/%u | Loss %d |\n", epoch, num_epochs, loss_history.back());
+            }
+
+            //Inspect loss
+            if (loss_history.back() < loss_goal) {
+                printf("[INFO] Loss goal reached!\n");
+                return;
+            }
+
+            if (patienceLRChange != 0 && patienceLRChange + plataue_start < epoch) {
+                bool plateau = true;
+                for (uint32_t pat = 1; pat <= patienceLRChange; pat++) {
+                    if (loss_history.back() < plateau_threshold * loss_history[loss_history.size() - pat]) {
+                        plateau = false;
+                        break;
+                    }
+                }
+                if (plateau) {
+                    printf("[INFO] Plateau detected. Adapting learning rate\n");
+                    lrAccumulatedFactor *= lrPlateauFactor;
+                }
+            }
+            if (patienceEarlyStopping != 0 && patienceEarlyStopping + plataue_start < epoch) {
+                bool plateau = true;
+                for (uint32_t pat = 1; pat <= patienceEarlyStopping; pat++) {
+                    if (loss_history.back() < plateau_threshold * loss_history[loss_history.size() - pat]) {
+                        plateau = false;
+                        break;
+                    }
+                }
+                if (plateau) {
+                    printf("[INFO] Early stopping triggered!\n");
+                    return;
+                }
+
+            }
+        }
+    }
+
+//https://arxiv.org/pdf/1812.01187.pdf
+//https://arxiv.org/pdf/1608.03983.pdf
+}
 
 //Old implementation
 #if 0
@@ -3351,135 +3489,25 @@ public:
 
 int main()
 {
-    cudaStream_t str;
-    cudaStreamCreate(&str);
+    CUBLAS_ERROR(cublasCreate(&cublas_handle));
+    //Logging
+    cublasSetAtomicsMode(cublas_handle, CUBLAS_ATOMICS_ALLOWED);
+    cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
 
-    cublasSetup(8ull * 1024ull * 1024ull, str); //8Mb workspace (default according to debugging with nsight compute, even though documentation says 4mb)
+    //Set cublas workspace
 
+    //Block dimension
+
+    //Set cuda stream
+    //set vector, matrixes (async), pointer mode
+
+    //Initialize random
     Random::init_rand();
 
-    //=======================================
-    using T = float;
-    using L = T;
-    constexpr uint32_t N = 4;  //Has to multiple of 4 so "weights" is aligned
-    T alpha = (T)0.01;
 
-    std::vector<Layer<T>*> layers;
-    layers.push_back(new Input_Layer<T>(N));
-    layers.push_back(new FullyConnected_Layer<T>(ACTIVATION_TYPE::RELU, N));
-    layers.push_back(new FullyConnected_Layer<T>(ACTIVATION_TYPE::RELU, N));
+    //Maybe have to change indexing mode to start with 0 instead of 1 using #define IDX2C(i,j,ld) (((j)*(ld))+(i))
 
-    NetworkBuilder<T, L> network(layers, 16, 1, OPTIMIZER_TYPE::SGD);
-    network.allocate();
-    network.initialize();
 
-    network.opt->setLR(&alpha, nullptr, nullptr, str);
-
-    Loss<T>* loss = new MSE_Loss<T>();
-    loss->setParameters((T*)layers[2]->state, layers[2]->outStateShape, 1);
-
-    //======
-    cudaGraph_t forward  = network.getForwardGraph  (str);
-    cudaGraph_t backward = network.getBackwardsGraph(str);
-    cudaGraph_t delta    = loss  ->getDeltaGraph    (str);
-    
-    cudaGraphExec_t forw, backw, delt;
-    char errorBuf[512];
-    cudaGraphNode_t errNode;
-
-    cudaGraphInstantiate(&forw, forward, &errNode, +errorBuf, 512);
-    if (errorBuf[0]) {
-        fprintf(stderr, "[ERROR] The following error arose during the instantiation of the forward graph: %s", +errorBuf);
-        exit(-1);
-    }
-    cudaGraphInstantiate(&backw, backward, &errNode, +errorBuf, 512);
-    if (errorBuf[0]) {
-        fprintf(stderr, "[ERROR] The following error arose during the instantiation of the backward graph: %s", +errorBuf);
-        exit(-1);
-    }
-    cudaGraphInstantiate(&delt, delta, &errNode, +errorBuf, 512);
-    if (errorBuf[0]) {
-        fprintf(stderr, "[ERROR] The following error arose during the instantiation of the delta graph: %s", +errorBuf);
-        exit(-1);
-    }
-    //========
-
-    BUGP("Yay\n");
-    T* in_data, *out_data;
-    cudaMalloc(&in_data , sizeof(T) * N);
-    cudaMalloc(&out_data, sizeof(T) * N);
-    
-    T*  in_data_host = (T*)malloc(sizeof(T) * (N * N + N));
-    T* out_data_host = (T*)malloc(sizeof(T) * N);
-    
-    cudaMemcpy( in_data,  in_data_host, sizeof(T) * N, cudaMemcpyHostToDevice);
-    cudaMemcpy(out_data, out_data_host, sizeof(T) * N, cudaMemcpyHostToDevice);
-
-    //Layer<T>* fiLa_, *laLa;
-    //network.getFirstAndLastLayer(fiLa_, laLa);
-    //Input_Layer<T>* fila = (Input_Layer<T>*)fiLa_;
-    ((Input_Layer<T>*)layers[0])->setInputPointer(&in_data, str);
-    loss->setTarget(&out_data, str);
-
-    while(getchar()!='e'){
-        for (uint32_t ind = 0; ind < N; ind++) {
-            in_data_host[ind] = 1;
-            out_data_host[ind] = 2;
-        }
-        clear_console();
-        cudaGraphLaunch(forw, str);
-
-        //===========================
-        //Printing
-        cudaDeviceSynchronize();
-        BUGP("In-Data:\n");
-        ARR_PRINT(in_data_host, N, 1);
-
-        BUGP("\n\Bias Layer 1:\n");
-        gpuErrchk(cudaMemcpy(in_data_host, layers[1]->other, sizeof(T) * (N + N * N), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        ARR_PRINT_COLMAJ(&in_data_host[0], N, 1);
-        BUGP("\n\nWeights Layer 1:\n");
-        ARR_PRINT_COLMAJ(&in_data_host[N], N, N);
-
-        BUGP("\n\nState Layer 1:\n");
-        gpuErrchk(cudaMemcpy(in_data_host, layers[1]->state, sizeof(T) * N, cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        ARR_PRINT(in_data_host, N, 1);
-
-        BUGP("\n\Bias Layer 2:\n");
-        gpuErrchk(cudaMemcpy(in_data_host, layers[2]->other, sizeof(T) * (N + N * N), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        ARR_PRINT_COLMAJ(&in_data_host[0], N, 1);
-        BUGP("\n\nWeights Layer 2:\n");
-        ARR_PRINT_COLMAJ(&in_data_host[N], N, N);
-
-        BUGP("\n\nState Layer 2:\n");
-        gpuErrchk(cudaMemcpy(in_data_host, layers[2]->state, sizeof(T) * N, cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        ARR_PRINT(in_data_host, N, 1);
-        //=======================
-
-        cudaGraphLaunch(delt, str);
-        cudaGraphLaunch(backw, str);
-    }
-    
-#if 0
-    gpuErrchk(cudaDeviceSynchronize());
-    cudaGraphLaunch(forw, str);
-    gpuErrchk(cudaDeviceSynchronize());
-    BUGP("Forward done\n");
-    cudaGraphLaunch(delt, str);
-    gpuErrchk(cudaDeviceSynchronize());
-    BUGP("Delta done\n");
-    cudaGraphLaunch(backw, str);
-    gpuErrchk(cudaDeviceSynchronize());
-    BUGP("Backward done\n");
-#endif
-
-    
-
-    BUGP("\n\nDone");
 
     CHECK_CUDA_ERROR();
 
@@ -3557,4 +3585,4 @@ for (int32_t N_ = 8192; N_ <= MAX_N; N_++) {
 }
 #endif
 
-//Windows: clang++ Network.cpp -o Network.exe -I"D:\Librarys\CImg-2.9.2_pre070420" -I"D:\Librarys\VS-NuGet\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\include" -I"D:\Librarys\GLFW\include" -I"D:\Librarys\glew-2.1.0\include" -I"D:\Librarys\freetype-2.10.3\include" -L"D:\Librarys\GLFW\lib" -L"D:\Librarys\glew-2.1.0\lib\Release\x64" -L"D:\Librarys\VS-NuGet\lib" -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.2/bin" -L"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\lib\x64" -L"D:\Librarys\freetype-2.10.3\objs" -O0 -march=native -m64 -std=c++2a -Wall -lzlib -llibpng16 -ljpeg -lkernel32 -luser32 -lgdi32 -lopengl32 -lglu32 -lglew32 -lglfw3dll -lpsapi -lwinspool -lcomdlg32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid -lodbc32 -lodbccp32 -lcudart_static -lcublas -lfreetype -g -DDEBUG
+//Windows: clang++ Network.cpp -o Network.exe -I"D:\Librarys\CImg-2.9.2_pre070420" -I"D:\Librarys\VS-NuGet\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0\include" -I"D:\Librarys\GLFW\include" -I"D:\Librarys\glew-2.1.0\include" -I"D:\Librarys\freetype-2.10.3\include" -L"D:\Librarys\GLFW\lib" -L"D:\Librarys\glew-2.1.0\lib\Release\x64" -L"D:\Librarys\VS-NuGet\lib" -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v10.0/bin" -L"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0\lib\x64" -L"D:\Librarys\freetype-2.10.3\objs" -O0 -march=native -m64 -std=c++17 -Wall -lzlib -llibpng16 -ljpeg -lkernel32 -luser32 -lgdi32 -lopengl32 -lglu32 -lglew32 -lglfw3dll -lpsapi -lwinspool -lcomdlg32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid -lodbc32 -lodbccp32 -lcudart_static -lcublas -lfreetype -g -DDEBUG

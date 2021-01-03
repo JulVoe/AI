@@ -174,11 +174,7 @@ int main()
     //Initialize random
     Random::init_rand();
 
-    Base* b = new Derived();
-    printf("%d", b->i);
-    b->a();
-    return 0;
-
+    
     //===============================================
 #if 0
     float* a, *one, *buf;
@@ -262,38 +258,39 @@ int main()
 #endif
 
 
-#if 0
+#if 1
     cudaGraph_t graph;
     cudaGraphCreate(&graph, 0);
-    cudaGraphNode_t node;
-    uint32_t arg = 4;
     uint32_t* gMem;
     cudaMalloc(&gMem, sizeof(uint32_t) * 32);        
     
-    void* nodeArgs[] = {
-        (void*)& arg,
-        (void*)& gMem
-    };
-    cudaKernelNodeParams nodeParam {
-        (void*)kern,                          //Function pointer
-        dim3(1, 1, 1),                        //Grid dimensions
-        dim3(32, 1, 1),                       //Block dimensions
-        0u,                                   //Dyn. shared-mem per block in bytes */
-        (void**)&nodeArgs,                    //Array of pointers to individual kernel arguments
-        nullptr                               //Pointer to kernel arguments in the "extra" format
-    };
-    cudaGraphAddKernelNode(&node, graph, nullptr, 0, &nodeParam);
+    cudaGraphNode_t node;
+    cudaMemsetParams memsetParams = { 0 };
+    memsetParams.dst = (void*)gMem;
+    memsetParams.value = 4;
+    memsetParams.pitch = 0;
+    memsetParams.elementSize = sizeof(uint32_t);
+    memsetParams.width = 32;
+    memsetParams.height = 1;
+
+    cudaGraphAddMemsetNode(&node, graph, nullptr, 0, &memsetParams);
 
 //==============================================
-    uint32_t arg2 = 7;
-    void* nodeArgs2[] = {
-        (void*)& arg2,
-        (void*)& gMem
-    };
-    //memcpy(nodeArgs, nodeArgs2, sizeof(void*) * 2);
-    nodeParam.kernelParams = (void**)&nodeArgs2;
-    memset((void*)&node, 0, sizeof(node));
+    cudaGraphNode_t node_ = node;
 
+    cudaGraphNode_t node2;
+    cudaMemsetParams memsetParams2 = { 0 };
+    memsetParams2.dst = (void*)gMem;
+    memsetParams2.value = 7;
+    memsetParams2.pitch = 0;
+    memsetParams2.elementSize = sizeof(uint32_t);
+    memsetParams2.width = 32;
+    memsetParams2.height = 1;
+
+    cudaGraphAddMemsetNode(&node, graph, nullptr, 0, &memsetParams2);
+
+
+    cudaGraphAddDependencies(graph, &node, &node_, 1);
 //==============================================
     char buf[256];
     cudaGraphNode_t errNode;

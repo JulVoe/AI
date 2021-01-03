@@ -16,7 +16,7 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #ifdef WIN32
-#include <C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0\um\gl\GLU.h>
+#include <gl\GLU.h>
 #endif
 
 #include <inttypes.h>
@@ -28,7 +28,11 @@
 #include <stdio.h>
 #include <cstdlib>
 
+#if defined(__GNUC__) or defined(_clang__)
 #include <x86intrin.h>
+#else
+#include <immintrin.h>
+#endif
 
 #include "util.cpp"
 using namespace Random;
@@ -875,6 +879,18 @@ public:
         fread(cpu_tiles[1], sizeof(T), sample_size[1] * tile_samples_cpu, fd_out);
     }
     
+    /*
+        Returns the shapes of augmented in- an output samples
+    */
+    inline void getAugmentedShapes(Image_Shape& in_shape, Image_Shape& out_shape) {
+        in_shape  = sample_shape[2];
+        out_shape = sample_shape[3];
+    }
+    inline void getNumSamples(uint32_t& n_train_samples, uint32_t& n_validation_sample) {
+        n_train_samples = train_samples;
+        n_validation_sample = validation_samples;
+    }
+
     /*
         Sets augmenation and infers size of augmentated samples (sample_size[2] and sample_size[3])
     */

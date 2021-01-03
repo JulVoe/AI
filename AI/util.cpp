@@ -1,12 +1,12 @@
 #pragma once
 //TODO: RANDOM and IMAGE namespace algorithms are slow
-#define AI_VERSION 0u
+#define AI_VERSION 1u
 
 #undef min
 #undef max
-template<typename T> T max(T a, T b) { return (a > b) ? a : b; }
-template<typename T> T min(T a, T b) { return (a < b) ? a : b; }
-template<typename T> T abs(T x) { return (x >= (T)0) ? x : -x; }
+template<typename T> constexpr T max(T a, T b) { return (a > b) ? a : b; }
+template<typename T> constexpr T min(T a, T b) { return (a < b) ? a : b; }
+template<typename T> constexpr T abs(T x) { return (x >= (T)0) ? x : -x; }
 /*union {
         float f;
         int32_t i;
@@ -54,7 +54,6 @@ uint16_t sizeOfType(uint32_t typeId) {
         return sizeof(double);
     default:
         assert(0 == 1);
-        __builtin_unreachable();
     }
 }
 
@@ -63,7 +62,12 @@ uint16_t sizeOfType(uint32_t typeId) {
 //=======================================================
 
 //C++
+#if defined(__GNUC__) or defined(__clang__)
 #include <x86intrin.h>
+#else
+#include <immintrin.h>
+#endif
+
 #define CONC_(x,y) x##y
 #define CONC(x,y) CONC_(x,y)
 #define BUGP(x) printf(x);fflush(stdout);
@@ -71,16 +75,32 @@ uint16_t sizeOfType(uint32_t typeId) {
 #define STALL(); while(true){}
 void YMM_PRINT(__m256  x) { float v[8]; _mm256_storeu_ps((float*)+v, x); printf("%f %f %f %f %f %f %f %f\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
 void YMM_PRINT(__m256i x) { int   v[8]; _mm256_storeu_si256((__m256i*) + v, x); printf("%d %d %d %d %d %d %d %d\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }                                                                                                                                            
-template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";if(std::is_pointer<T>::value)return "%p";assert(0==1);__builtin_unreachable();/*Unknown type*/}
+template<typename T> char* PRINTF_FLAG(T i) {if(typeid(T)==typeid(uint8_t)||typeid(T)==typeid(uint16_t)||typeid(T)==typeid(uint32_t)||typeid(T)==typeid(uint64_t))return "%llu";if(typeid(T)==typeid(int8_t)||typeid(T)==typeid(int16_t)||typeid(T)==typeid(int32_t)||typeid(T)==typeid(int64_t))return "%lld";if(typeid(T)==typeid(float)||typeid(T)==typeid(double))return "%f";if(std::is_pointer<T>::value)return "%p";assert(0==1);/*Unknown type*/}
 template<typename T> void  PRINT_VAR(T i) { printf(PRINTF_FLAG(i), i); fflush(stdout); }
 template<typename T> void  ARR_PRINT(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_+y_*x]);printf("\t");}printf("\n");}printf("----------------\n");}
 template<typename T> void  ARR_PRINT_COLMAJ(T* arr, uint32_t x, uint32_t y) { printf("----------------\n");for(uint32_t y_=0;y_!=y;y_++){for(uint32_t x_=0;x_!=x;x_++){PRINT_VAR(arr[x_*y+y_]);printf("\t");}printf("\n");}printf("----------------\n");}
 
 #ifndef static_warning
+#if defined(__GNUC__) or defined(__clang__)
 #warning static_warning was not defined
+#else
+#pragma message("static_warning was not defined")
+#endif
+
 #include <cstdio>
 #define static_warning(a,b) do{if(!(a)){printf(b"\n");}}while(0);
 #endif
+
+void clear_console() {
+#ifdef __unix__
+    printf("\x1B[2J\x1B[H");
+#elif defined(WIN32) || defined(_WIN32) || defined(_WIN64)
+#include <cstdlib>
+    std::system("cls");  //I know this is bad but somehow include "windows.h" does not compile
+#else
+    static_warning(0==1, "[WARNING] Unsupported operating system for clearing console.");
+#endif
+}
 
 //Cuda + Cublas
 #ifdef DEBUG
@@ -246,10 +266,261 @@ void CheckDebugLog()
 
 #define ALL_GL_ERRORS(); CheckDebugLog(); showGLerror();
 
+
+//=====================================================
+//==================|Cublas Setup|=====================
+//=====================================================
+#include "cuda_runtime.h"
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+
+cublasHandle_t cublas_handle;
+struct CublasConstants {
+    double* d[2];
+    float * f[2];
+    half  * h[2];
+} cublasConst;
+
+/*
+    Initializes the global cublas variables (see above).
+
+    @param cublasWorkspaceSize: The number of bytes to use for cublas' workspace. Will be alloced internally.
+    @param stream             : The stream to use for cublas operations
+    @param logging            : If true, turns on cublas logging to stderr 
+*/
+void cublasSetup(size_t cublasWorkspaceSize, cudaStream_t stream, bool logging = false) {
+    //1.: Create handle
+    CUBLAS_ERROR(cublasCreate(&cublas_handle));
+
+    //Maybe have to change indexing mode to start with 0 instead of 1 using #define IDX2C(i,j,ld) (((j)*(ld))+(i))
+
+    //2.: Configure Options
+    cublasSetAtomicsMode(cublas_handle, CUBLAS_ATOMICS_ALLOWED);
+    cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_DEVICE);
+    
+    cublasSetStream(cublas_handle, stream);
+
+    //3.: Set workspace
+    void* cublasWorkspace;
+    cudaMalloc(&cublasWorkspace, cublasWorkspaceSize);
+    cublasSetWorkspace(cublas_handle, cublasWorkspace, cublasWorkspaceSize);
+
+    //4.: Set up constants
+    double* d;
+    float * f;
+    half  * h;
+    cudaMalloc(&d, sizeof(double) * 2);
+    cudaMalloc(&f, sizeof(float ) * 2);
+    cudaMalloc(&h, sizeof(half  ) * 2);
+
+    double d_host[2] = { (double)0., (double)1. };
+    float  f_host[2] = { (float )0., (float )1. };
+    half   h_host[2] = { (half  )0., (half  )1. };
+
+    cudaMemcpyAsync(d, +d_host, sizeof(double) * 2, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(f, +f_host, sizeof(float ) * 2, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(h, +h_host, sizeof(half  ) * 2, cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream);
+
+    cublasConst.d[0] = d;
+    cublasConst.d[1] = d + 1;
+    cublasConst.f[0] = f;
+    cublasConst.f[1] = f + 1;
+    cublasConst.h[0] = h;
+    cublasConst.h[1] = h + 1;
+
+    //4.: Logging
+    if(logging)
+        cublasLoggerConfigure(true, false, true, nullptr);   //Turn on logging to stderr
+}
+
+//==============================================================
+//==================|Dependency management|=====================
+//==============================================================
+#include <vector>
+#include "cuda_runtime.h"
+struct Dependencies {
+    std::vector<cudaGraphNode_t> unblocked_accesses;
+    bool write_accesses;
+
+    Dependencies() :
+        unblocked_accesses(), write_accesses()
+    {}
+
+    Dependencies(std::vector<cudaGraphNode_t> unblocked_accesses, bool write_accesses) :
+        unblocked_accesses(unblocked_accesses), write_accesses(write_accesses)
+    {}
+
+
+    /*
+        The node "node" reads or writes to memory segment with this dependencies.
+        Applies these dependencies to "graph" and updates them.
+
+        @param write: True, if "node" writes to the memory segment guarded by this. False, if it just reads it
+        @param graph: The graph the nodes are in
+        @param dep  : The dependencies for the memory region. Will be updated
+        @param node : The node that either reads or writes to the memory segment guarded by this
+    */
+    template<bool write>
+    void apply(cudaGraph_t& graph, cudaGraphNode_t node) {
+        if (unblocked_accesses.empty()) {
+            write_accesses = write;
+            unblocked_accesses.push_back(node);
+
+            return;
+        }
+
+        if constexpr (write) { //node depends on read and write dependencies of "dep"
+            //1.: Apply dependencies       
+            for (uint32_t dep = 0; dep != unblocked_accesses.size(); dep++)
+                cudaGraphAddDependencies(graph, &unblocked_accesses[dep], &node, 1);
+
+            //2.: Update dependencies
+            unblocked_accesses.clear();
+            unblocked_accesses.push_back(node);
+            write_accesses = true;
+        }
+        else {       //node only interferes with writes
+            if constexpr (write) {
+                //1.: Applies dependencies
+                for (uint32_t dep = 0; dep != unblocked_accesses.size(); dep++)
+                    cudaGraphAddDependencies(graph, &unblocked_accesses[dep], &node, 1);
+
+                //2.: Update dependencies
+                unblocked_accesses.clear();
+                unblocked_accesses.push_back(node);
+                write_accesses = false;
+            }
+            else {
+                //No interference
+                unblocked_accesses.push_back(node);
+            }
+
+        }
+    }
+};
+
+//==========================================================
+//==================|Memory management|=====================
+//==========================================================
+#include <inttypes.h>
+#include <cstdio>
+#include <memory>
+#include "cuda_runtime.h"
+
+template<typename T>
+constexpr T roundUpMult(T numToRound, T multiple)               //Returns first number >=numberToRound divvisible by multiple. multiple has to be positive
+{
+    assert(multiple);
+    return ((numToRound + multiple - 1) / multiple);
+}
+
+template<typename T>
+constexpr T roundUpMultPow2(T numToRound, T multiple)       //Returns first number >=numberToRound divvisible by multiple. multiple has to be a power of two
+{
+    assert(multiple && ((multiple & (multiple - 1)) == 0));
+    return (numToRound + multiple - 1) & -multiple;
+}
+
+struct MemoryRequirement {
+public:
+    uint64_t num_bytes;   //Lenght of memory in bytes
+    uint32_t alignment;   //The minimum number of bytes the pointer needs to be aligned to. Has to be power of 2
+
+    constexpr MemoryRequirement(uint64_t num_bytes = 0ull, uint32_t alignment = 1u) :
+        num_bytes(num_bytes),
+        alignment(alignment)
+    {
+        assert((alignment & (alignment - 1)) == 0);
+    }
+
+    constexpr MemoryRequirement operator+(MemoryRequirement mr2) {
+        return MemoryRequirement(
+            roundUpMultPow2<uint64_t>(num_bytes, mr2.alignment) + mr2.num_bytes, //num_bytes
+            max(alignment, mr2.alignment)                                        //Alignment
+        );
+    }
+
+    constexpr void operator+=(MemoryRequirement mr2) {
+        MemoryRequirement sum = operator+(mr2);
+
+        num_bytes = sum.num_bytes;
+        alignment = sum.alignment;
+    }
+
+    void print() {
+        printf("\nmr.num_bytes = %llu\nmr.alignment = %u\n", num_bytes, alignment);
+    }
+
+    void serialize(FILE* file) {
+        fwrite(&num_bytes, sizeof(num_bytes), 1, file);
+        fwrite(&alignment, sizeof(alignment), 1, file);
+    }
+    static void deserialize(FILE* file, MemoryRequirement* out) {
+        fread(&out->num_bytes, sizeof(out->num_bytes), 1, file);
+        fread(&out->alignment, sizeof(out->alignment), 1, file);
+    }
+};
+
+template<> constexpr MemoryRequirement max<MemoryRequirement>(MemoryRequirement a, MemoryRequirement b) { 
+    return MemoryRequirement(max(a.num_bytes, b.num_bytes), max(a.alignment, b.alignment));  
+}
+
+inline bool is_aligned(const void* ptr, uint64_t alignment) noexcept {
+    static_assert(sizeof(uintmax_t) >= sizeof(void*), "[ERROR] No suitable integer type for conversion from pointer type");
+    return !(reinterpret_cast<std::uintptr_t>(ptr) % alignment);
+}
+template<typename T>
+inline T* align_pointer_unsafe(T* ptr, uint64_t alignment) {
+    //See https://github.com/KabukiStarship/KabukiToolkit/wiki/Fastest-Method-to-Align-Pointers
+    return reinterpret_cast<T*>((reinterpret_cast<uintptr_t>(ptr) + alignment - 1u) & -(alignment));
+}
+
+cudaError_t cudaMallocAligned(void** out, MemoryRequirement mr) {
+    //Accrding to https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses 5.3.2.1.1, cudaMalloc has alignemt of 256bytes
+
+    if (mr.alignment <= 256) {
+        return cudaMalloc(out, mr.num_bytes);
+    }
+    else {
+        fprintf(stderr, "[WARNING] Very high alignment of %u bytes requested!", mr.alignment);
+        cudaError_t ret = cudaMalloc(out, mr.num_bytes + mr.alignment - 1);
+
+        //std::align(mr.alignment, mr.num_bytes, out, mr.num_bytes + mr.alignment - 1);
+        *out = align_pointer_unsafe(*out, mr.alignment);
+
+        return ret;
+    }
+}
+
+/*
+class GpuMemBlock {
+    const uint32_t id;
+
+    const bool growable;
+
+    uint64_t size;
+    uint64_t capacity;
+    void* mem;
+};
+
+class CudaAllocator {
+    void* memory;
+    uint64_t size;
+
+
+};
+*/
+
 //===============================================
 //==================|RANDOM|=====================
 //===============================================
+#if defined(__GNUC__) or defined(__clang__)
 #include <x86intrin.h>
+#else
+#include <immintrin.h>
+#endif
 #include <random>
 
 namespace Random {
@@ -465,12 +736,10 @@ struct Image_Shape {
         fwrite(&z, sizeof(z), 1, file);
     }
 
-    static Image_Shape deserialize(FILE* file) {
-        Image_Shape ret{};
-        fread(&ret.x, sizeof(ret.x), 1, file);
-        fread(&ret.y, sizeof(ret.y), 1, file);
-        fread(&ret.z, sizeof(ret.z), 1, file);
-        return ret;
+    static void deserialize(FILE* file, Image_Shape* out) {
+        fread(&out->x, sizeof(out->x), 1, file);
+        fread(&out->y, sizeof(out->y), 1, file);
+        fread(&out->z, sizeof(out->z), 1, file);
     }
 };
 
@@ -847,7 +1116,7 @@ namespace Image {
         uint32_t wl = wIdeal;  if (wl % 2 == 0) wl--;
         uint32_t wu = wl + 2u;
 
-        float mIdeal = (12.f * stdev * stdev - (float)(n * wl * wl + 4 * n * wl + 3 * n)) / (float)(-4 * wl - 4);
+        float mIdeal = (12.f * stdev * stdev - (float)(n * wl * wl + 4.f * n * wl + 3.f * n)) / (float)(-4.f * wl - 4.f);
         uint32_t m = mIdeal + 0.5f;
         //printf("Actual sigma: %d", sqrt((float)(m * wl * wl + (n - m) * wu * wu - n) / 12.f ));
         
@@ -1021,7 +1290,7 @@ namespace Image {
         }
     }
 
-    //TODO: not inplemented
+    //TODO: not implemented
     template<typename T>
     void rotate(T* dat, Image_Shape shape, float deg) {
         assert(0 == 1);
