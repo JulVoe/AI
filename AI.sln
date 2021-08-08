@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.30002.166
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AI", "AI\AI.vcxproj", "{885C2516-46C4-400F-B8D0-283E135DEAFA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{885C2516-46C4-400F-B8D0-283E135DEAFA}.Debug|x64.ActiveCfg = Debug|x64
+		{885C2516-46C4-400F-B8D0-283E135DEAFA}.Debug|x64.Build.0 = Debug|x64
+		{885C2516-46C4-400F-B8D0-283E135DEAFA}.Release|x64.ActiveCfg = Release|x64
+		{885C2516-46C4-400F-B8D0-283E135DEAFA}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {EE1E7287-B705-4E2A-B0D8-84881FE33E7E}
+	EndGlobalSection
+EndGlobal
