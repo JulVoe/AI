@@ -6,7 +6,8 @@
 //============================================================
 //==================|Declare new classes|=====================
 //============================================================
-enum ACTIVATION_TYPE : uint32_t { ACTIVATION_IDENTITY = 0, ACTIVATION_RELU = 1, ACTIVATION_SOFTMAX = 2, ACTIVATION_SOFTMAX_TEMP = 3, ACTIVATION_SIGMOID = 4, ACTIVATION_TANH = 5, ACTIVATION_SOFTPLUS = 6 };  //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
+//The following is already declared in OperationGraph.cpp:
+//enum ACTIVATION_TYPE : uint32_t { ACTIVATION_IDENTITY = 0, ACTIVATION_RELU = 1, ACTIVATION_SOFTMAX = 2, ACTIVATION_SOFTMAX_TEMP = 3, ACTIVATION_SIGMOID = 4, ACTIVATION_TANH = 5, ACTIVATION_ELU = 6, ACTIVATION_SWISH = 7, ACTIVATION_SOFTPLUS = 8 };  //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
 class Activation;
 class Activation_Identity;
 class Activation_Relu;
@@ -22,48 +23,48 @@ class Activation_Softplus;
 
 class Activation {
 public:
-	TYPE data_type;
-	TYPE computation_type;
+	TYPE data_type;                   //Should be set in constructor
+	TYPE computation_type;            //Should be set in constructor
 
 protected:
-	TensorDesc* memory;                           //The memory this activates
+	TensorDesc* memory_;                                   //The memory this activates
 
-	std::vector<ConstantDesc*> internalDesc;      //Descriptors of constants needed for computations (e.g.  temperature)
-	std::vector<TensorDesc*>   tmpTensors;        //Temporary tensors of computation
+	std::unordered_map<std::string, ConstantDesc*> constants; //Constants
+	std::unordered_map<std::string, TensorDesc*  > variables; //Variables
 
 public:
 	//Constructor
 	Activation() {
-		throw new std::runtime_error("[ERROR] Trying to create a base class activation");
+		throw std::runtime_error("[ERROR] Trying to create a base class activation");
 	}
 
 	//Setters
-	inline void setMemory(TensorDesc* memory_) {
-		if (memory_->getTypeId() != data_type) throw new std::runtime_error("[ERROR] Trying to set activation memory to a type that is not the data type of the activation");
+	inline void setMemory(TensorDesc* memory) {
+		if (memory->getTypeId() != data_type) throw std::runtime_error("[ERROR] Trying to set activation memory to a type that is not the data type of the activation");
 
-		memory = memory_;
+		memory_ = memory;
 	}
 
 	//Getters
 	inline TensorDesc* getMemory() const {
-		return memory;
+		return memory_;
 	}
 
 	//Methods
 	virtual void forward(OperationGraph* graph) {
-		throw new std::runtime_error("[ERROR] Trying to forward propagate through base class activation");
+		throw std::runtime_error("[ERROR] Trying to forward propagate through base class activation");
 	}
 
 	virtual void backward(OperationGraph* graph, Optimizer* optimizer) {
-		throw new std::runtime_error("[ERROR] Trying to backward propagate through base class activation");
+		throw std::runtime_error("[ERROR] Trying to backward propagate through base class activation");
 	}
 
-	//Serialization
+	//Serialization    TODO!!!!
 	/*
 		Return the derived class type of the object
 	*/
 	virtual ACTIVATION_TYPE getType() const {
-		throw new std::runtime_error("[ERROR] Trying to call \"getType\" on base class optimizer");
+		throw std::runtime_error("[ERROR] Trying to call \"getType\" on base class optimizer");
 	}
 	/*
 		Returns a pointer to a newly created default initialized object of the specified derived class
@@ -136,16 +137,13 @@ public:
 };
 
 class Activation_Identity : public Activation {
-	//internalDesc = {}
-	//tmpTensors   = {}
-
 public:
 	//Constructor
-	Activation_Identity() {
-		this->internalDesc     = std::vector<ConstantDesc*>();
-		this->tmpTensors       = std::vector<TensorDesc*>();
-		this->data_type        = (TYPE)-1;
-		this->computation_type = (TYPE)-1;
+	Activation_Identity(TYPE data_type = TYPE::TYPE_FLOAT, TYPE computation_type = TYPE::TYPE_FLOAT) {
+		this->constants        = std::unordered_map<std::string, ConstantDesc*>();
+		this->variables        = std::unordered_map<std::string, TensorDesc*  >();
+		this->data_type        = data_type;
+		this->computation_type = computation_type;
 	}
 
 	//Methods
@@ -155,50 +153,112 @@ public:
 	//Serialization
 	virtual ACTIVATION_TYPE getType() const override {
 		return ACTIVATION_TYPE::ACTIVATION_IDENTITY;
-	}
+	}							
 };
 
-class Activation_Relu : public Activation {
-	//internalDesc = {}
-	//tmpTensors   = {}
-
-public:
-	//Constructor
-	Activation_Relu() {
-		this->internalDesc     = std::vector<ConstantDesc*>();
-		this->tmpTensors       = std::vector<TensorDesc*>();
-		this->data_type        = (TYPE)-1;
-		this->computation_type = (TYPE)-1;
-	}
-
-	//Methods
-	virtual void forward(OperationGraph* graph) override {	
-		Operation_Pointwise* op = new Operation_Pointwise()
-			->setInTensor(this->getMemory())
-			->setOutTensor(this->getMemory())
-			->setPointwiseType(POINTWISE_TYPE::POINTWISE_RELU)
-			->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.),
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.)
-				});
-
-		graph->addNode(op);
-	}
-	virtual void backward(OperationGraph* graph, Optimizer* optimizer) override {
-		Operation_Pointwise* op = new Operation_Pointwise()
-			->setInTensor (this->getMemory())
-			->setOutTensor(this->getMemory())
-			->setPointwiseType(POINTWISE_TYPE::POINTWISE_RELU)
-			->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.),
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.)
-				});
-
-		graph->addNode(op);
-	}
-
-	//Serialization
-	virtual ACTIVATION_TYPE getType() const override {
-		return ACTIVATION_TYPE::ACTIVATION_RELU;
-	}
+#define SIMPLE_ACTIVATION(class_name, activation_type)                                                               \
+class class_name : public Activation {																				 \
+public:																												 \
+	/*Constructor*/																									 \
+	class_name(TYPE data_type = TYPE::TYPE_FLOAT, TYPE computation_type = TYPE::TYPE_FLOAT) {						 \
+		this->constants = std::unordered_map<std::string, ConstantDesc*>();											 \
+		this->variables = std::unordered_map<std::string, TensorDesc*  >();											 \
+		this->data_type = data_type;																				 \
+		this->computation_type = computation_type;																	 \
+	}																												 \
+																													 \
+	/*Methods*/																										 \
+	virtual void forward(OperationGraph* graph) override {															 \
+		graph->addNode((new Operation_Activation_Forward())															 \
+			->setActivationType(activation_type)													                 \
+			->setInTensor(this->memory_)																			 \
+			->setOutTensor(this->memory_)																			 \
+			->setBlendConstants({																					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(1.),					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(0.)					 \
+			})																										 \
+		);																											 \
+	}																												 \
+	virtual void backward(OperationGraph* graph, TensorDesc*& deltas, Optimizer* optimizer) override {    			 \
+		graph->addNode((new Operation_Activation_Backward())												    	 \
+			->setActivationType(activation_type)													                 \
+			->setInTensor(this->memory_)																			 \
+			->setOutTensor(this->memory_)																			 \
+			->setDeltaTensor(deltas)																				 \
+			->setBlendConstants({																					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(1.),					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(0.)					 \
+			})   																									 \
+		);																											 \
+	}																												 \
+																													 \
+	/*Serialization*/																							     \
+	virtual ACTIVATION_TYPE getType() const override {																 \
+		return activation_type;																	                     \
+	}																												 \
 };
+
+#define ONE_VAR_ACTIVATION(class_name, param_name, activation_type)                                                  \
+class class_name : public Activation {																				 \
+public:																												 \
+	/*Constructor*/																									 \
+	class_name(TYPE data_type = TYPE::TYPE_FLOAT, TYPE computation_type = TYPE::TYPE_FLOAT) {						 \
+		this->constants = std::unordered_map<std::string, ConstantDesc*>();											 \
+		this->variables = std::unordered_map<std::string, TensorDesc*  >();											 \
+		this->data_type = data_type;																				 \
+		this->computation_type = computation_type;																	 \
+																													 \
+		this->variables.emplace(param_name, (new TensorDesc())														 \
+			->setTypeId(this->data_type)																			 \
+			->setSize({1u, 1u, 1u, 1u, 1u})																			 \
+			->setStrides({1u, 1u, 1u, 1u, 1u})																		 \
+			->setAlignment(MIN_ALIGN)																				 \
+			->setIsNeeded(true)																						 \
+			->setUseIndirection(false)																				 \
+		);														                                                     \
+	}																												 \
+																													 \
+	/*Methods*/																										 \
+	virtual void forward(OperationGraph* graph) override {															 \
+		graph->addNode((new Operation_Activation_Forward())															 \
+			->setActivationType(activation_type)													                 \
+			->setInTensor(this->memory_)																			 \
+			->setArgument(this->variables[param_name])											     				 \
+			->setOutTensor(this->memory_)																			 \
+			->setBlendConstants({																					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(1.),					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(0.)					 \
+			})																										 \
+		);																											 \
+	}																												 \
+	virtual void backward(OperationGraph* graph, Optimizer* optimizer) override {									 \
+		graph->addNode((new Operation_Activation_Backward())														 \
+			->setActivationType(activation_type)													                 \
+			->setInTensor(this->memory_)																			 \
+			->setArgument(this->variables[param_name])											     				 \
+			->setOutTensor(this->memory_)																			 \
+			->setBlendConstants({																					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(1.),					 \
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(0.)					 \
+				})																									 \
+		);																											 \
+		
+	}																												 \
+																													 \
+	/*Serialization*/																							     \
+	virtual ACTIVATION_TYPE getType() const override {																 \
+		return activation_type;																	                     \
+	}																												 \
+};
+
+
+SIMPLE_ACTIVATION(Activation_Relu    , ACTIVATION_TYPE::ACTIVATION_RELU    );
+SIMPLE_ACTIVATION(Activation_Softmax , ACTIVATION_TYPE::ACTIVATION_SOFTMAX );
+SIMPLE_ACTIVATION(Activation_Sigmoid , ACTIVATION_TYPE::ACTIVATION_SIGMOID );
+SIMPLE_ACTIVATION(Activation_Tanh    , ACTIVATION_TYPE::ACTIVATION_TANH    );
+SIMPLE_ACTIVATION(Activation_Swish   , ACTIVATION_TYPE::ACTIVATION_SWISH   );
+SIMPLE_ACTIVATION(Activation_Softplus, ACTIVATION_TYPE::ACTIVATION_SOFTPLUS);
+
+
+
+

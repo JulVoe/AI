@@ -13,6 +13,8 @@
 
 //TODO: Intermediate types
 
+#define MIN_ALIGN 16u
+
 //============================================================
 //==================|Declare new classes|=====================
 //============================================================
@@ -303,9 +305,9 @@ public:
 */
 
 enum OPERATION_TYPE   : uint32_t { OPERATION_FILL = 0, OPERATION_COPY = 1, OPERATION_BIAS = 2, OPERATION_BINARY = 3, OPERATION_GEMM = 4, OPERATION_CONV = 5, OPERATION_REDUCE = 6, OPERATION_POINTWISE = 7, OPERATION_ACTIVATION_FORWARD = 8, OPERATION_ACTIVATION_BACKWARD = 9, OPERATION_HOST = 10 };
-enum POINTWISE_TYPE   : uint32_t { POINTWISE_ADD = 0, POINTWISE_SUB = 1, POINTWISE_MUL = 2, POINTWISE_DIV = 3, POINTWISE_SQUARE = 4, POINTWISE_ROOT = 5, POINTWISE_REC = 6, POINTWISE_ROOT_REC = 7 , POINTWISE_POW = 8, POINTWISE_SIGN = 9, POINTWISE_CLIP = 10};
+enum POINTWISE_TYPE   : uint32_t { POINTWISE_ADD = 0, POINTWISE_SUB = 1, POINTWISE_MUL = 2, POINTWISE_DIV = 3, POINTWISE_SQUARE = 4, POINTWISE_SQRT = 5, POINTWISE_REC = 6, POINTWISE_SQRT_REC = 7 , POINTWISE_POW = 8, POINTWISE_SIGN = 9, POINTWISE_CLIP = 10};
 enum BINARY_TYPE      : uint32_t { BINARY_ADD = 0, BINARY_SUB = 1, BINARY_MUL = 2, BINARY_DIV = 3 };
-enum ACTIVATION_TYPE  : uint32_t { ACTIVATION_RELU = 0, ACTIVATION_SIGMOID = 1, ACTIVATION_TANH = 2, ACTIVATION_SOFTPLUS = 3, ACTIVATION_SOFTMAX = 4, ACTIVATION_SOFTMAX_TEMP = 5 };
+enum ACTIVATION_TYPE  : uint32_t { ACTIVATION_IDENTITY = 0, ACTIVATION_RELU = 1, ACTIVATION_SOFTMAX = 2, ACTIVATION_SOFTMAX_TEMP = 3, ACTIVATION_SIGMOID = 4, ACTIVATION_TANH = 5, ACTIVATION_ELU = 6, ACTIVATION_SWISH = 7, ACTIVATION_SOFTPLUS = 8 };  //DON'T CHANGE THESE VALUES AS IT WILL BREAK OLD CHECKPOINT FILES!
 enum CONVOLUTION_TYPE : uint32_t { CONVOLUTION = 0, CROSS_CORRELATION = 1 };
 enum REDUCE_TYPE      : uint32_t { SUM = 0, MEAN = 1, VARIANCE = 2 };
 
@@ -1344,7 +1346,7 @@ public:
 };
 
 //Fused operations
-//Fuse move/scale/fill/add/mult after any operation using blending coefficients, if tensor is not needed and result is only used once. Copy into itself=mult. Eliminate moves. Fill = pointwise add/sub with indirection ->transform. Divsion = multiplication with invers
+//Fuse move/scale/fill/add/mult after any operation using blending coefficients, if tensor is not needed and result is only used once. Copy into itself=mult. Eliminate moves. Fill = pointwise add/sub with indirection ->transform. Divsion = multiplication with invers. fill(x)+fill(y)=fill(x+y), similar for all binary operations. x*fill(y)=fill(x*y) and similar for every pointwise operation. Make fill redundant in general by using bias-like reads. Pull if's out and forward (multiple execution strands)
 struct Operation_Fused_GEMM_Add_Pointwise : public Operation {
 	/*
 		Fused (matrix multiplication), (bias addition), (pointwise operation): out = poinwise(in[0] * in[1] + in[2])
@@ -1409,13 +1411,13 @@ public:
 		Default constructor
 	*/
 	OperationNode() :
-		dependencies(), operation(), graphNode()
+		operation(), dependencies(), graphNode()
 	{}
 	/*
 		Constructs node from operation. Default initialises all other variables
 	*/
 	OperationNode(Operation* op) :
-		operation(op)
+		operation(op), dependencies(), graphNode()
 	{}
 
 	//Setter methods
@@ -1483,8 +1485,9 @@ public:
 		//1.: Walk the graph and fuse operations and delete unused operations
 		//2.: Decide, which tensors are virtual (set this in tensor descriptors) and which are tmp (mem can be reused)
 		//3.: Allocate and distribute memory (set in tensor descriptors). Because of the different alignment criteria, pick the memory layout that minimizes memory consumption
-		//4.: Generate the dependencies (call Dependency guards of tensors which will generate dependencies of nodes)
-		//5.: Build the cuda graph
+		//4.: Optimize: Remove uneccessary operations and fuse others
+		//5.: Generate the dependencies (call Dependency guards of tensors which will generate dependencies of nodes)
+		//6.: Build the cuda graph
 
 		//JIT?!
 

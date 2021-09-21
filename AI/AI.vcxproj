@@ -114,6 +114,7 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Activation.cpp" />
     <ClCompile Include="Dataset.cpp" />
     <ClCompile Include="Inference.cpp" />
     <ClCompile Include="kernel.cpp" />

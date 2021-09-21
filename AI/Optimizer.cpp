@@ -11,7 +11,7 @@
 //============================================================
 //==================|Declare new classes|=====================
 //============================================================
-enum OPTIMIZER_TYPE : uint32_t { OPTIMIZER_NONE = 0, OPTIMIZER_DBUG = 1, OPTIMIZER_SGD = 2, OPTIMIZER_SGD_MOMENT = 3, OPTIMIZER_ADAM = 4 };
+enum OPTIMIZER_TYPE : uint32_t { OPTIMIZER_NONE = 0, OPTIMIZER_DEBUG = 1, OPTIMIZER_SGD = 2, OPTIMIZER_SGD_MOMENT = 3, OPTIMIZER_ADAM = 4 };
 class Optimizer;
 class Optimizer_None;
 class Optimizer_SGD;
@@ -19,12 +19,12 @@ class Optimizer_Debug;
 class Optimizer_Adam;
 
 
-#ifdef TODO
+enum LINE_SEARCH : uint16_t { NONE = 0, BACKTRACKING_ARMIJO = 1 };
 //===================================================
 //==================|Line search|====================
 //===================================================
+#ifdef TODO
 
-enum LINE_SEARCH : uint16_t { NONE = 0, BACKTRACKING_ARMIJO = 1 };
 class BacktrackingLineSearch {
 	/*
 		Performs a onedimensional backtracking linesearch (adds it to graph)
@@ -105,8 +105,8 @@ public:
 //TODO: Let user register hyperparams as constant so ConstantDesc can be registered as constant and inlined in OperationGraph
 class Optimizer {
 public:
-	TYPE data_type;        //The type of the variables the optimizer optimizes
-	TYPE computation_type; //The type used for computations
+	TYPE data_type;        //The type of the variables the optimizer optimizes. Should be set in constructor
+	TYPE computation_type; //The type used for computations. Should be set in constructor
 
 protected:
 	std::unordered_map<std::string, double>                                       hyperparams;
@@ -149,11 +149,12 @@ public:
 	/*
 		Exposes hyperparams to user by returning pointer to them so user can read/write to them.
 	*/
-	std::unordered_map<std::string, double>* getHyperparamPointer() const {
+	std::unordered_map<std::string, double>* getHyperparamPointer() {
 		return &hyperparams;
 	}
 
 	//Serialization
+	//TODO
 	/*
 		Return the derived class type of the object
 	*/
@@ -170,7 +171,7 @@ public:
 		case OPTIMIZER_TYPE::OPTIMIZER_NONE:
 			return new Optimizer_None();
 			break;
-		case OPTIMIZER_TYPE::OPTIMITER_DBUG:
+		case OPTIMIZER_TYPE::OPTIMIZER_DEBUG:
 			return new Optimizer_Debug();
 			break;
 		case OPTIMIZER_TYPE::OPTIMIZER_SGD:
@@ -211,30 +212,32 @@ enum DEBIAS         : uint16_t { NONE = 0, APPROX = 1, EXACT = 2 };
 enum RECTIFY        : uint16_t { NONE = 0, APPROX = 1, EXACT = 2 };
 enum CLIPPING       : uint16_t { NONE = 0, GRADIENT = 1, STEP = 2 };
 enum CENTRALIZATION : uint16_t { NONE = 0, GRADIENT = 1, STEP = 2 };
+enum NORMALIZE      : uint16_t { NONE = 0, GRADIENT = 1, GRADIENT_LARS = 2, GRADIENT_LAMB = 3, STEP = 4, STEP_LARS = 5, STEP_LAMB = 6, WEIGHT = 7, WEIGHT_SCALEINV = 8, WEIGHT_NOT_SCALEINV = 9 };
 enum DEBUG_INFO     : uint16_t { NONE = 0, GRADIENT = 1, STEP = 2, MOMENTUM_BUF = 3, ADAPTIVE_BUF = 4 };
-enum WEIGHT_DECAY   : uint16_t { NONE = 0, L1 = 0b01, L2 = 0b10, GRAD_PLAIN = 1 << 2, GRAD_VANILLA_LR = 2 << 2, STEP_PLAIN = 3 << 2, STEP_VANILLA_LR = 4 << 2, STEP_EFFECTIVE_LR = 5 << 2, STEP_EFFECTIVE_LR_MEAN = 6 << 2};
+enum WEIGHT_DECAY   : uint16_t { NONE = 0, L1 = 0b01, L2 = 0b10, GRAD_PLAIN = 1 << 2, GRAD_VANILLA_LR = 2 << 2, STEP_PLAIN = 3 << 2, STEP_VANILLA_LR = 4 << 2, STEP_EFFECTIVE_LR = 5 << 2, STEP_EFFECTIVE_LR_MEAN = 6 << 2 };
 WEIGHT_DECAY operator^(WEIGHT_DECAY a, WEIGHT_DECAY b) { return (WEIGHT_DECAY)((uint16_t)a ^ (uint16_t)b); }
 WEIGHT_DECAY operator&(WEIGHT_DECAY a, WEIGHT_DECAY b) { return (WEIGHT_DECAY)((uint16_t)a & (uint16_t)b); }
 WEIGHT_DECAY operator>>(WEIGHT_DECAY a, uint32_t s) { return (WEIGHT_DECAY)((uint16_t)a >> s); }
 
-//TODO: Madgrad, Adam2k, Adamax, Heavyball, Diffgrad, Adamod, Adabelieve, LARS, LAMB
+//TODO: Madgrad, Adam2k, Adamax, Heavyball, Diffgrad, Adamod
 //TODO: Line search
+//TODO: Reduce over different dimensions
 class FirtOrder_Optimizer : public Optimizer {
 	/*
 		Optimizes a set of variables with only their first order gradient information
 	*/
 
 	/*
-			g += "weightDecay" * w
-			g = centralize(clip(g))
+			g = normalize(centralize(clip(g) [ + "weightDecay" [*lr] * w]))
 			m = "momentumDecay" * m + "momentumNew" * g
 			n = "adaptiveDecay" * n + "adaptiveNew" * (g*g)
-			n_deb = bound("debiasAdaptive" / f(n + eps))
-			fac = ("debiasMomentum" * m + "nestrovFactor" * g) * n_deb [ + "weightDecay" * w] [ + "weightDecay" * mean(n_deb) * w]
-			step = centralize(project(clip("stepSize" * fac [ + "weightDecay" * w])))
+			n_deb = bound("rectify" * "debiasAdaptive" / f(n + eps))
+			fac = ("debiasMomentum" * m + "nestrovFactor" * g [ + "weightDecay" * w]) * n_deb 
+			step = normalize(centralize(project(clip("stepSize" * normalize(fac) [ + "weightDecay" * w] [ + "weightDecay" * mean(n_deb) * w]))))
 			"stepSize" = "oldStepSizeDecay" * "stepSize" + "oldStepSizeNew" * step
 			save debug
 			w -= step
+			normalize(w)
 			if(lookaheadSyncBool) w = w_old + "lookaheadStepSize" * (w - w_old); w_old = w
 
 			Optimizations:
@@ -252,17 +255,19 @@ private:
 	bool arg_boundAdaptive       ;
 	DEBIAS arg_deBias            ;
 	CENTRALIZATION arg_centralize;
+	NORMALIZE arg_normalize      ;
 	LINE_SEARCH arg_lineSearch   ;
 	uint32_t arg_lookahead       ;
 	bool arg_deltaLr             ;
 	bool arg_projection          ;
 	bool arg_rectify             ;
+	bool arg_believe             ;
 	DEBUG_INFO arg_debug         ;
 
 public:
-	FirstOrder_Optimizer(
-		TYPE data_type,
-		TYPE computation_type     = data_type,
+	FirtOrder_Optimizer(
+		TYPE data_type            = TYPE::TYPE_FLOAT,
+		TYPE computation_type     = TYPE::TYPE_FLOAT,
 		MOMENTUM momentum         = MOMENTUM::NESTROV,
 		ADAPTIVE adaptive         = ADAPTIVE::NONE,
 		WEIGHT_DECAY decay        = WEIGHT_DECAY::L2 ^ WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN,
@@ -270,11 +275,13 @@ public:
 		bool boundAdaptive        = false,
 		DEBIAS deBias             = DEBIAS::NONE, 
 		CENTRALIZATION centralize = CENTRALIZATION::GRADIENT,
+		NORMALIZE normalize       = NORMALIZE::NONE,
 		LINE_SEARCH lineSearch    = LINE_SEARCH::NONE,
 		uint32_t lookahead        = 0u,
 		bool deltaLr              = false,
 		bool projection           = true,
 		bool rectify              = false,
+		bool believe              = false,
 		DEBUG_INFO debug          = DEBUG_INFO::NONE 
 	) :
 		arg_momentum     (momentum     ), 
@@ -284,52 +291,56 @@ public:
 		arg_boundAdaptive(boundAdaptive),
 		arg_deBias	     (deBias	   ),
 		arg_centralize   (centralize   ),
+		arg_normalize    (normalize    ),
 		arg_lineSearch   (lineSearch   ),
 		arg_lookahead    (lookahead    ),
 		arg_deltaLr	     (deltaLr      ),
 		arg_projection   (projection   ),
 		arg_rectify      (rectify      ),
+		arg_believe      (believe      ),
 		arg_debug        (debug        )
 	{
 		//0.: Check consistency
 		if (debug == DEBUG_INFO::MOMENTUM_BUF && momentum == MOMENTUM::NONE)
-			throw new std::runtime_error("[ERROR] Optimizer can't save momentum buffer if no momentum is used!");
+			throw std::runtime_error("[ERROR] Optimizer can't save momentum buffer if no momentum is used!");
 		if (debug == DEBUG_INFO::ADAPTIVE_BUF && adaptive == ADAPTIVE::NONE)
-			throw new std::runtime_error("[ERROR] Optimizer can't save adaptive buffer if no adaptivity is used!");
+			throw std::runtime_error("[ERROR] Optimizer can't save adaptive buffer if no adaptivity is used!");
 		if (decay != WEIGHT_DECAY::NONE && !(decay & (WEIGHT_DECAY::L1 | WEIGHT_DECAY::L2)))
-			throw new std::runtime_error("[ERROR] If optimizer uses weight decay, it must be either L1 or L2!");
+			throw std::runtime_error("[ERROR] If optimizer uses weight decay, it must be either L1 or L2!");
 		if (((decay & ~0b11) == WEIGHT_DECAY::STEP_EFFECTIVE_LR || (decay & ~0b11) == WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN) && adaptive == ADAPTIVE::NONE )
-			throw new std::runtime_error("[ERROR] If optimizer uses weight decay based on effective lr, it also needs to use adaptive lr!");
+			throw std::runtime_error("[ERROR] If optimizer uses weight decay based on effective lr, it also needs to use adaptive lr!");
 		if (boundAdaptive && !adaptive)
-			throw new std::runtime_error("[ERROR] If optimizer wants to bound the adaptive lr, it has to use adaptive lr!");
+			throw std::runtime_error("[ERROR] If optimizer wants to bound the adaptive lr, it has to use adaptive lr!");
 		if (rectify && !adaptive)
-			throw new std::runtime_error("[ERROR] If optimizer wants to rectify the adaptive lr, it has to use adaptive lr!");
-		if (debias != DEBIAS::NONE && momentum == MOMENTUM::NONE && adaptive == ADAPTIVE::NONE)
-			throw new std::runtime_error("[ERROR] If optimizer debias, it has to use momentum or adapitve!");
+			throw std::runtime_error("[ERROR] If optimizer wants to rectify the adaptive lr, it has to use adaptive lr!");
+		if (deBias != DEBIAS::NONE && momentum == MOMENTUM::NONE && adaptive == ADAPTIVE::NONE)
+			throw std::runtime_error("[ERROR] If optimizer debias, it has to use momentum or adapitve!");
+		if (believe && adaptive == ADAPTIVE::NONE)
+			throw std::runtime_error("[ERROR] If optimizer wants to use believe for the adaptive lr, it has to use a adaptive lr!");
 
 		//1.: Set base class member variables
 		this->data_type        = data_type;
 		this->computation_type = computation_type;
-		this->constants        = std::unordered_map<std::string, ConstantDesc*>;
+		this->constants        = std::unordered_map<std::string, ConstantDesc*>();
 		this->buffers          = std::unordered_map<TensorDesc*, std::unordered_map<std::string, TensorDesc*>>();
 		this->hyperparams      = std::unordered_map<std::string, double>();
 
-		constexpr double Nan = std::nan("0");
-		if (debias != DEBIAS::NONE) this->hyperparams.emplace("timeStep"     , Nan);
+		const double Nan = std::nan("0");
+		if (deBias != DEBIAS::NONE) this->hyperparams.emplace("timeStep", Nan);
 		if (deltaLr) {
 			this->hyperparams.emplace("deltaNew"  , Nan);
 			this->hyperparams.emplace("deltaDecay", Nan);
 		}
-		else this->hyperparams.emplace("stepSize"     , Nan);
+		else this->hyperparams.emplace("stepSize", Nan);
 		if (momentum != MOMENTUM::NONE){
 			this->hyperparams.emplace("momentumNew"  , Nan);
 			this->hyperparams.emplace("momentumDecay", Nan);
 		}
 		if (momentum == MOMENTUM::NESTROV) this->hyperparams.emplace("momentumDecayNext", Nan);
 		if (adaptive != ADAPTIVE::NONE) {
-			this->hyperpams.emplace("adaptiveNew"  , Nan);
-			this->hyperpams.emplace("adaptiveDecay", Nan);
-			this->hyperpams.emplace("epsilon"      , Nan);
+			this->hyperparams.emplace("adaptiveNew"  , Nan);
+			this->hyperparams.emplace("adaptiveDecay", Nan);
+			this->hyperparams.emplace("epsilon"      , Nan);
 		}
 		if (clipping != CLIPPING::NONE) {
 			this->hyperparams.emplace("clipMin", Nan);
@@ -340,20 +351,20 @@ public:
 			this->hyperparams.emplace("boundMax", Nan);
 		}
 		if (decay != WEIGHT_DECAY::NONE) this->hyperparams.emplace("weightDecay", Nan);
-
+		if (normalize == NORMALIZE::GRADIENT_LAMB || normalize == NORMALIZE::STEP_LAMB) this->hyperparams.emplace("trustClip", Nan);
 
 		//2.: Set helper variables
-		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_debias));
+		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_deBias));
 		bool momentumHasFactor = momentumNeedFactor;
 
-		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_debias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
+		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_deBias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
 		bool adaptiveNeedInnerFactor = adaptiveNeedFactor && arg_boundAdaptive;
 		bool adaptiveHasInnerFactor = adaptiveNeedInnerFactor;
 		bool adaptiveHasOuterFactor = !adaptiveNeedInnerFactor && adaptiveNeedFactor && !momentumHasFactor;
 		bool adaptiveHasFactor = adaptiveHasInnerFactor || adaptiveHasOuterFactor;
 		bool inlineAdaptive = adaptiveNeedFactor && !adaptiveHasFactor;
 
-		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor);
+		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor) && !(normalize == NORMALIZE::GRADIENT_LAMB || normalize == NORMALIZE::GRADIENT_LARS || normalize == NORMALIZE::STEP_LAMB || normalize == NORMALIZE::STEP_LARS);
 
 		//3.: Set up constants		
 		if (deltaLr) {
@@ -377,11 +388,11 @@ public:
 
 		if (adaptive != ADAPTIVE::NONE) {
 			this->constants.emplace("adaptiveDecay", (new ConstantDesc(this->data_type))->setUseIndirection(true));
-			this->constants.emplace("adaptiveNew", (new ConstantDesc(this->data_type))->setUseIndirection(true));
-			this->constants.emplace("epsilon", (new ConstantDesc(this->data_type))->setUseIndirection(true));
+			this->constants.emplace("adaptiveNew"  , (new ConstantDesc(this->data_type))->setUseIndirection(true));
+			this->constants.emplace("epsilon"      , (new ConstantDesc(this->data_type))->setUseIndirection(true));
 
 			if (adaptiveHasFactor)
-				this->constants->emplace("adaptiveDebias", (new ConstantDesc(this->data_type))->setUseIndirection(true));
+				this->constants.emplace("adaptiveDebias", (new ConstantDesc(this->data_type))->setUseIndirection(true));
 		}
 
 		if (boundAdaptive) {
@@ -394,7 +405,7 @@ public:
 			this->constants.emplace("clippingMax", (new ConstantDesc(this->data_type))->setUseIndirection(true));
 		}
 
-		if (weight_decay != WEIGHT_DECAY::NONE) {
+		if (decay != WEIGHT_DECAY::NONE) {
 			this->constants.emplace("weightDecay", (new ConstantDesc(this->data_type))->setUseIndirection(true));
 		}
 
@@ -411,47 +422,79 @@ public:
 
 	virtual void applyDeltaToMemory(OperationGraph* graph, TensorDesc* mem, TensorDesc* deltas, bool scaleInvariant = false) override {
 		//0.: Check input
-		if (this->data_type != mem->getTypeId())    throw new std::runtime_error("[ERROR] Optimizer requires memory to be of the previously specified data type");
-		if (this->data_type != deltas->getTypeId()) throw new std::runtime_error("[ERROR] Optimizer requires deltas to be of the previously specified data type");
+		if (this->data_type != mem->getTypeId())    throw std::runtime_error("[ERROR] Optimizer requires memory to be of the previously specified data type");
+		if (this->data_type != deltas->getTypeId()) throw std::runtime_error("[ERROR] Optimizer requires deltas to be of the previously specified data type");
 
 		//1.: Set up buffers
-		if (this->buffers.contains(mem)) throw new std::runtime_error("[ERROR] This optimizer was already called on these variables before!");
+		if (this->buffers.find(mem) != this->buffers.end()) throw std::runtime_error("[ERROR] This optimizer was already called on these variables before!");
 		std::unordered_map<std::string, TensorDesc*> optBufs;
-		if (momentum != MOMENTUM::NONE)	optBufs.emplace("momentum", (new TensorDesc(mem))->setIsNeeded(true));
-		if (adaptive != ADAPTIVE::NONE) optBufs.emplace("adaptive", (new TensorDesc(mem))->setIsNeeded(true));
-		if (lookahead)                  optBufs.emplace("lookahead", (new TensorDesc(mem))->setIsNeeded(true));
-		if (deltaLr)                    optBufs.emplace("deltaLr", (new TensorDesc(mem))->setIsNeeded(true));
-		if (debug)                      optBufs.emplace("debug", (new TensorDesc(mem))->setIsNeeded(true));
+		if (arg_momentum != MOMENTUM::NONE)	optBufs.emplace("momentum" , (new TensorDesc(mem))->setIsNeeded(true));
+		if (arg_adaptive != ADAPTIVE::NONE) optBufs.emplace("adaptive" , (new TensorDesc(mem))->setIsNeeded(true));
+		if (arg_lookahead)                  optBufs.emplace("lookahead", (new TensorDesc(mem))->setIsNeeded(true));
+		if (arg_deltaLr)                    optBufs.emplace("deltaLr"  , (new TensorDesc(mem))->setIsNeeded(true));
+		if (arg_debug)                      optBufs.emplace("debug"    , (new TensorDesc(mem))->setIsNeeded(true));
+		this->buffers.emplace(mem, optBufs);
 
 		//1.5.: Helper variables
-		ConstantDesc* ZERO = (new ConstantDesc(this->data_type))->setUseIndirection(false)->setValue(0.);
-		ConstantDesc* ONE  = (new ConstantDesc(this->data_type))->setUseIndirection(false)->setValue(1.);
-
-		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_debias));
+		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_deBias));
 		bool momentumHasFactor = momentumNeedFactor;
 
-		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_debias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
+		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_deBias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
 		bool adaptiveNeedInnerFactor = adaptiveNeedFactor && arg_boundAdaptive;
 		bool adaptiveHasInnerFactor = adaptiveNeedInnerFactor;
 		bool adaptiveHasOuterFactor = !adaptiveNeedInnerFactor && adaptiveNeedFactor && !momentumHasFactor;
 		bool adaptiveHasFactor = adaptiveHasInnerFactor || adaptiveHasOuterFactor;
 		bool inlineAdaptive = adaptiveNeedFactor && !adaptiveHasFactor;
 
-		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor);
+		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor) && !(arg_normalize == NORMALIZE::GRADIENT_LAMB || arg_normalize == NORMALIZE::GRADIENT_LARS || arg_normalize == NORMALIZE::STEP_LAMB || arg_normalize == NORMALIZE::STEP_LARS);
 
+		ConstantDesc* ZERO = (new ConstantDesc(this->computation_type))->setUseIndirection(false)->setValue(0.);
+		ConstantDesc* ONE  = (new ConstantDesc(this->computation_type))->setUseIndirection(false)->setValue(1.);
+
+		TensorDesc* l2MemNorm = (new TensorDesc())         //Needed for projection and lamb/lars normailzation
+			->setTypeId(this->data_type)
+			->setSize({ mem->getSize()[0], mem->getSize()[1], 1u, 1u, 1u })
+			->setStrides({ mem->getSize()[0] * mem->getSize()[1], mem->getSize()[1], 1u, 1u, 1u })
+			->setAlignment(mem->getAlignment())
+			->setIsNeeded(false)
+			->setUseIndirection(false);
+		{
+			TensorDesc* mem_squared = new TensorDesc(mem);
+			TensorDesc* mem_normalized = new TensorDesc(mem);
+			graph->addNode((new Operation_Pointwise()) //Square mem
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+				->setInTensor(mem)
+				->setOutTensor(mem_squared)
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Reduce()) //Reduce squared mem over spatial dimensions
+				->setReduceType(REDUCE_TYPE::SUM)
+				->setInTensor(mem_squared)
+				->setOutTensor(l2MemNorm)
+				->setReduceDimensions({ 2u,3u,4u })
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
+				->setInTensor(l2MemNorm)
+				->setOutTensor(l2MemNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
+		}
+		
 		//2.: Compute lr
 		TensorDesc* oldStepsRoot = new TensorDesc(optBufs["deltaLr"]);
 		if (arg_deltaLr) {
 			graph->addNode((new Operation_Pointwise())
-				->setPointwiseType(POINTWISE_TYPE::SQRT)
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
 				->setInTensor(optBufs["deltaLr"])
 				->setOutTensor(oldStepsRoot)
 				->setBlendConstants({ ONE, ZERO })
 			);
 		}
 
-		//2.: Regularization pre update
-		//2.1: Clipping
+		//3.: Regularization pre update
+		//3.1: Clipping
 		if (arg_clipping == CLIPPING::GRADIENT) {
 			graph->addNode((new Operation_Pointwise())
 				->setInTensor(deltas)
@@ -462,27 +505,27 @@ public:
 			);
 		}
 
-		//2.2.: Gradient weight decay
+		//3.2.: Gradient weight decay
 		if ((arg_decay & ~0b11) == WEIGHT_DECAY::GRAD_PLAIN ||
 			((arg_decay & ~0b11) == WEIGHT_DECAY::GRAD_VANILLA_LR && !arg_deltaLr)) {
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				graph->addNode((new Operation_Pointwise())
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
 					->setInTensor(mem)
-					->setOutTensor(delta)
+					->setOutTensor(deltas)
 					->setBlendConstants({ this->constants["weightDecay"], ONE })
 				);
 			}
 			else { //L2
 				graph->addNode((new Operation_Copy())
 					->setInTensor(mem)
-					->setOutTensor(delta)
+					->setOutTensor(deltas)
 					->setBlendConstants({ this->constants["weightDecay"], ONE })
 				);
 			}
 		}
 		if ((arg_decay & ~0b11) == WEIGHT_DECAY::GRAD_VANILLA_LR && arg_deltaLr) {
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				TensorDesc* memSgn = new TensorDesc(mem);
 				graph->addNode((new Operation_Pointwise())
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
@@ -493,7 +536,7 @@ public:
 				graph->addNode((new Operation_Binary())
 					->setBinaryType(BINARY_TYPE::BINARY_MUL)
 					->setInTensors(memSgn, oldStepsRoot)
-					->setOutTensor(delta)
+					->setOutTensor(deltas)
 					->setBlendConstants({ this->constants["weightDecay"], ONE })
 				);
 			}
@@ -501,13 +544,13 @@ public:
 				graph->addNode((new Operation_Binary())
 					->setBinaryType(BINARY_TYPE::BINARY_MUL)
 					->setInTensors(mem, oldStepsRoot)
-					->setOutTensor(delta)
+					->setOutTensor(deltas)
 					->setBlendConstants({ this->constants["weightDecay"], ONE })
 				);
 			}
 		}
 
-		//2.3.: Centralization
+		//3.3.: Centralization
 		if (arg_centralize == CENTRALIZATION::GRADIENT) {
 			TensorDesc* gradient_mean = (new TensorDesc())
 				->setTypeId(this->data_type)
@@ -517,7 +560,7 @@ public:
 				->setIsNeeded(false)
 				->setUseIndirection(false);
 			
-			graph->addNode((new Operation_Reduce())     //Compute mean
+			graph->addNode((new Operation_Reduce()) //Compute mean
 				->setReduceType(REDUCE_TYPE::MEAN)
 				->setInTensor(deltas)
 				->setOutTensor(gradient_mean)
@@ -528,14 +571,98 @@ public:
 				->setConstant(gradient_mean)
 				->setOutTensor(deltas)
 				->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
+					new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(-1.0),
 					ONE
 				})
 			);
 		}
+		
+		//3.4.: Normalize
+		if (arg_normalize == NORMALIZE::GRADIENT || arg_normalize == NORMALIZE::GRADIENT_LAMB || arg_normalize == NORMALIZE::GRADIENT_LARS) {
+			//Compute gradient norm
+			TensorDesc* deltas_squared = new TensorDesc(deltas);
+			TensorDesc* deltas_normalized = new TensorDesc(deltas);
+			TensorDesc* l2DeltasNorm = (new TensorDesc())
+				->setTypeId(this->data_type)
+				->setSize({ deltas->getSize()[0], deltas->getSize()[1], 1u, 1u, 1u })
+				->setStrides({ deltas->getSize()[0] * deltas->getSize()[1], deltas->getSize()[1], 1u, 1u, 1u })
+				->setAlignment(deltas->getAlignment())
+				->setIsNeeded(false)
+				->setUseIndirection(false);
+			graph->addNode((new Operation_Pointwise()) //Square deltas
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+				->setInTensor(deltas)
+				->setOutTensor(deltas_squared)
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Reduce()) //Reduce squared deltas over spatial dimensions
+				->setReduceType(REDUCE_TYPE::SUM)
+				->setInTensor(deltas_squared)
+				->setOutTensor(l2DeltasNorm)
+				->setReduceDimensions({ 2u,3u,4u })
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
+				->setInTensor(l2DeltasNorm)
+				->setOutTensor(l2DeltasNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
 
-		//3.: Update gradient buffers
-		//3.1.: Momentum buffer
+			if (arg_normalize == NORMALIZE::GRADIENT) {
+				TensorDesc* factor = new TensorDesc(deltas);
+				graph->addNode((new Operation_Fill()) //Fill norm
+					->setConstant(l2DeltasNorm)
+					->setOutTensor(factor)
+					->setBlendConstants({ ONE, ZERO })
+				);
+
+				//Apply
+				graph->addNode((new Operation_Binary())
+					->setBinaryType(BINARY_TYPE::BINARY_DIV)
+					->setInTensors(deltas, factor)
+					->setOutTensor(deltas)
+					->setBlendConstants({ ONE, ZERO })
+				);
+			}
+			else {
+				//Compute trust ratio
+				TensorDesc* trustRatio = new TensorDesc(deltas);
+				graph->addNode((new Operation_Binary())
+					->setBinaryType(BINARY_TYPE::BINARY_DIV)
+					->setInTensors(l2MemNorm, l2DeltasNorm)
+					->setOutTensor(l2DeltasNorm)
+					->setBlendConstants({ ONE, ZERO })
+				);
+
+				if (arg_normalize == NORMALIZE::GRADIENT_LAMB) {
+					graph->addNode((new Operation_Pointwise()) //Clip trust ratio
+						->setPointwiseType(POINTWISE_CLIP)
+						->setInTensor(l2DeltasNorm)
+						->setOutTensor(l2DeltasNorm)
+						->setArgument({ ZERO, this->constants["trustClip"] })
+						->setBlendConstants({ ONE, ZERO })
+					);
+				}
+
+				graph->addNode((new Operation_Fill()) //Fill norm
+					->setConstant(l2DeltasNorm)
+					->setOutTensor(trustRatio)
+					->setBlendConstants({ ONE, ZERO })
+				);
+
+				//Apply
+				graph->addNode((new Operation_Binary())
+					->setBinaryType(BINARY_TYPE::BINARY_MUL)
+					->setInTensors(deltas, trustRatio)
+					->setOutTensor(deltas)
+					->setBlendConstants({ ONE, ZERO })
+				);
+			}
+		}
+
+		//4.: Update gradient buffers
+		//4.1.: Momentum buffer
 		if (arg_momentum != MOMENTUM::NONE) {
 			graph->addNode((new Operation_Copy())
 				->setInTensor(deltas)
@@ -544,24 +671,41 @@ public:
 			);
 		}
 
-		//3.2.: Adaptive buffer
+		//4.2.: Adaptive buffer
 		if (arg_adaptive != ADAPTIVE::NONE) {
-			graph->addNode((new Operation_Pointwise())
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
-				->setInTensor(deltas)
-				->setOutTensor(optBufs["adaptive"])
-				->setBlendConstants({ this->constants["adaptiveNew"], this->constants["adaptiveDecay"] })
-			);
+			if (arg_believe) {
+				TensorDesc* tmp = new TensorDesc(deltas);
+				graph->addNode((new Operation_Binary())
+					->setBinaryType(BINARY_TYPE::BINARY_SUB)
+					->setInTensors(deltas, optBufs["momentum"])
+					->setOutTensor(tmp)
+					->setBlendConstants({ ONE, ZERO })
+				);
+				graph->addNode((new Operation_Pointwise())
+					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+					->setInTensor(tmp)
+					->setOutTensor(optBufs["adaptive"])
+					->setBlendConstants({ this->constants["adaptiveNew"], this->constants["adaptiveDecay"] })
+				);
+			}
+			else {
+				graph->addNode((new Operation_Pointwise())
+					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+					->setInTensor(deltas)
+					->setOutTensor(optBufs["adaptive"])
+					->setBlendConstants({ this->constants["adaptiveNew"], this->constants["adaptiveDecay"] })
+				);
+			}
 		}
 
-		//4.: Build step buffer
+		//5.: Build step buffer
 		TensorDesc* step = new TensorDesc(mem); //This holds the step every weights is moved in (actually this is the value that will be subtracted from every weight)
 
-		//4.1: Set gradient/momentum.
+		//5.1: Set gradient/momentum.
 		switch (arg_momentum) {
 		case MOMENTUM::NONE:
 			graph->addNode((new Operation_Copy())
-				->setInTensors(deltas)
+				->setInTensor(deltas)
 				->setOutTensor(step)
 				->setBlendConstants({ ONE, ZERO })
 			);
@@ -585,16 +729,16 @@ public:
 				->setInTensor(optBufs["momentum"])
 				->setOutTensor(step)
 				->setBlendConstants({
-					(arg_debias) ? this->constants["momentumDebias"] : ONE,
+					(arg_deBias) ? this->constants["momentumDebias"] : ONE,
 					ZERO
 				})
 			);
 			break;
 		}
 
-		//4.2.: Effective lr decay
+		//5.2.: Effective lr decay
 		if ((arg_decay & ~0b11) == WEIGHT_DECAY::STEP_EFFECTIVE_LR) {
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				graph->addNode((new Operation_Pointwise())
 					->setInTensor(mem)
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
@@ -611,7 +755,7 @@ public:
 			}
 		}
 		
-		//4.3.: Compute adaptive lr with rectification
+		//5.3.: Compute adaptive lr with rectification
 		TensorDesc* adaptiveMultiplier = new TensorDesc(optBufs["adaptive"]);
 		std::vector<Operation*> adaptiveOps;
 		switch (arg_adaptive) {
@@ -630,11 +774,11 @@ public:
 				->setPointwiseType(POINTWISE_TYPE::POINTWISE_ADD)
 				->setInTensor(adaptiveMultiplier)
 				->setOutTensor(adaptiveMultiplier)
-				->setArgument(this->constants["epsilon"])
+				->setArgument({ this->constants["epsilon"] })
 				->setBlendConstants({ ONE, ZERO })
 			);
 			adaptiveOps.push_back((new Operation_Pointwise()) //1/sqrt(x)
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_ROOT_REC)
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT_REC)
 				->setInTensor(adaptiveMultiplier)
 				->setOutTensor(adaptiveMultiplier)
 				->setBlendConstants({ ONE, ZERO })
@@ -645,18 +789,18 @@ public:
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_CLIP)
 					->setInTensor(adaptiveMultiplier)
 					->setOutTensor(adaptiveMultiplier)
-					->setArguments({ this->constants["adaptiveBoundMin"], this->constants["adaptiveBoundMax"] })
+					->setArgument({ this->constants["adaptiveBoundMin"], this->constants["adaptiveBoundMax"] })
 					->setBlendConstants({ ONE, ZERO })
 				);
 			}
 
-			adaptiveOps.push_back(new Operation_Binary())
+			adaptiveOps.push_back((new Operation_Binary())
 				->setBinaryType(BINARY_TYPE::BINARY_MUL)
 				->setInTensors(adaptiveMultiplier, step)
 				->setOutTensor(step)
 				->setBlendConstants({ ONE, ZERO })
-				);
-				break;
+			);
+			break;
 		case ADAPTIVE::CBRT:
 			adaptiveOps.push_back((new Operation_Copy())  //Debias if needed, else copy
 				->setInTensor(optBufs["adaptive"])
@@ -670,14 +814,14 @@ public:
 				->setPointwiseType(POINTWISE_TYPE::POINTWISE_ADD)
 				->setInTensor(adaptiveMultiplier)
 				->setOutTensor(adaptiveMultiplier)
-				->setArgument(this->constants["epsilon"])
+				->setArgument({ this->constants["epsilon"] })
 				->setBlendConstants({ ONE, ZERO })
 			);
 			adaptiveOps.push_back((new Operation_Pointwise()) //1/cbrt(x)
 				->setPointwiseType(POINTWISE_TYPE::POINTWISE_POW)
 				->setInTensor(adaptiveMultiplier)
 				->setOutTensor(adaptiveMultiplier)
-				->setArgument({ new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0 / 3.0) })
+				->setArgument({ new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(-1.0 / 3.0) })
 				->setBlendConstants({ ONE, ZERO })
 			);
 
@@ -686,21 +830,21 @@ public:
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_CLIP)
 					->setInTensor(adaptiveMultiplier)
 					->setOutTensor(adaptiveMultiplier)
-					->setArguments({ this->constants["adaptiveBoundMin"], this->constants["adaptiveBoundMax"] })
+					->setArgument({ this->constants["adaptiveBoundMin"], this->constants["adaptiveBoundMax"] })
 					->setBlendConstants({ ONE, ZERO })
 				);
 			}
 
-			adaptiveOps.push_back(new Operation_Binary())
+			adaptiveOps.push_back((new Operation_Binary())
 				->setBinaryType(BINARY_TYPE::BINARY_MUL)
 				->setInTensors(adaptiveMultiplier, step)
 				->setOutTensor(step)
 				->setBlendConstants({ ONE, ZERO })
-				);
-				break;
+			);
+			break;
 		}
 		
-		if (arg_rectification) {
+		if (arg_rectify) {
 			Operation_If* useRectification = (new Operation_If())
 				->setConditionConstant(this->constants["rectificationBool"]);
 
@@ -709,19 +853,19 @@ public:
 			
 			useRectification->addOperationFalse((new Operation_Fill())
 				->setConstant(ONE)
-				->setInTensor(adaptiveMultiplier);
+				->setOutTensor(adaptiveMultiplier)
 			);
 
-			graph->addOperation(useRectification);
+			graph->addNode(useRectification);
 		}
 		else {
 			for (Operation*& op : adaptiveOps)
 				graph->addNode(op);
 		}
 
-		//4.4.: Effective lr mean & vanilla lr decay
+		//5.4.: Effective lr mean & vanilla lr decay
 		if ((arg_decay & ~0b11) == WEIGHT_DECAY::STEP_VANILLA_LR) {
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				graph->addNode((new Operation_Pointwise())
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
 					->setInTensor(mem)
@@ -753,14 +897,15 @@ public:
 				->setInTensor(adaptiveMultiplier)
 				->setOutTensor(adaptiveMean)
 				->setReduceDimensions({ 2u,3u,4u })
-				->setBlendConstants({ ONE, ZERO });
+				->setBlendConstants({ ONE, ZERO })
+			);
 			graph->addNode((new Operation_Fill())  //Fill mean
 				->setConstant(adaptiveMean)
 				->setOutTensor(adaptiveMeanFilled)
 				->setBlendConstants({ ONE, ZERO })
 			);
 			
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				graph->addNode((new Operation_Pointwise())
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
 					->setInTensor(mem)
@@ -784,16 +929,83 @@ public:
 			);
 		}
 
-		//4.5.: Set stepsize
-		if (arg_deltaLr) {
+		//5.5.: Normalize for lamb/lars
+		if (arg_normalize == NORMALIZE::STEP_LARS || arg_normalize == NORMALIZE::STEP_LAMB) {
+			//Compute step norm
+			TensorDesc* step_squared = new TensorDesc(step);
+			TensorDesc* step_normalized = new TensorDesc(step);
+			TensorDesc* l2StepNorm = (new TensorDesc())
+				->setTypeId(this->data_type)
+				->setSize({ step->getSize()[0], step->getSize()[1], 1u, 1u, 1u })
+				->setStrides({ step->getSize()[0] * step->getSize()[1], step->getSize()[1], 1u, 1u, 1u })
+				->setAlignment(step->getAlignment())
+				->setIsNeeded(false)
+				->setUseIndirection(false);
+
+			graph->addNode((new Operation_Pointwise()) //Square deltas
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+				->setInTensor(step)
+				->setOutTensor(step_squared)
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Reduce()) //Reduce squared deltas over spatial dimensions
+				->setReduceType(REDUCE_TYPE::SUM)
+				->setInTensor(step_squared)
+				->setOutTensor(l2StepNorm)
+				->setReduceDimensions({ 2u,3u,4u })
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
+				->setInTensor(l2StepNorm)
+				->setOutTensor(l2StepNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			//Compute trust ratio
+			TensorDesc* trustRatio = new TensorDesc(step);
+			graph->addNode((new Operation_Binary())
+				->setBinaryType(BINARY_TYPE::BINARY_DIV)
+				->setInTensors(l2MemNorm, l2StepNorm)
+				->setOutTensor(l2StepNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			if (arg_normalize == NORMALIZE::STEP_LAMB) {
+				graph->addNode((new Operation_Pointwise()) //Clip trust ratio
+					->setPointwiseType(POINTWISE_CLIP)
+					->setInTensor(l2StepNorm)
+					->setOutTensor(l2StepNorm)
+					->setArgument({ ZERO, this->constants["trustClip"] })
+					->setBlendConstants({ ONE, ZERO })
+				);
+			}
+
+			graph->addNode((new Operation_Fill()) //Fill norm
+				->setConstant(l2StepNorm)
+				->setOutTensor(trustRatio)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			//Apply
 			graph->addNode((new Operation_Binary())
 				->setBinaryType(BINARY_TYPE::BINARY_MUL)
-				->setInTensors(oldStepRoot, step)
+				->setInTensors(step, trustRatio)
 				->setOutTensor(step)
 				->setBlendConstants({ ONE, ZERO })
 			);
 		}
-		else if ((!arg_debias && (arg_momentum != MOMENTUM::NONE || !arg_bounding) ) && arg_momentum != MOMENTUM::NESTROV) { //Else stepSize is inlined in debias factor
+
+		//5.6.: Set stepsize
+		if (arg_deltaLr) {
+			graph->addNode((new Operation_Binary())
+				->setBinaryType(BINARY_TYPE::BINARY_MUL)
+				->setInTensors(oldStepsRoot, step)
+				->setOutTensor(step)
+				->setBlendConstants({ ONE, ZERO })
+			);
+		}
+		else if (!inlineStepSize) { //Else stepSize is inlined in debias factor
 			graph->addNode((new Operation_Pointwise())
 				->setPointwiseType(POINTWISE_TYPE::POINTWISE_MUL)
 				->setInTensor(step)
@@ -803,9 +1015,9 @@ public:
 			);
 		}
 
-		//5.: Plain step weight decay
+		//5.7: Plain step weight decay
 		if ((arg_decay & ~0b11) == WEIGHT_DECAY::STEP_PLAIN) {
-			if (decay & WEIGHT_DECAY::L1) { //L1
+			if (arg_decay & WEIGHT_DECAY::L1) { //L1
 				graph->addNode((new Operation_Pointwise())
 					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
 					->setInTensor(mem)
@@ -837,39 +1049,10 @@ public:
 		//6.2.: Projection into tangent space
 		if (arg_projection && scaleInvariant) {
 			//Compute effective weights
-			TensorDesc* mem_squared    = new TensorDesc(mem);
+			TensorDesc* filledL2Norm   = new TensorDesc(mem);
 			TensorDesc* mem_normalized = new TensorDesc(mem);
-			TensorDesc* l2MemNorm = (new TensorDesc())
-				->setTypeId(this->data_type)
-				->setSize({ mem->getSize()[0], mem->getSize()[1], 1u, 1u, 1u })
-				->setStrides({ mem->getSize()[0] * mem->getSize()[1], mem->getSize()[1], 1u, 1u, 1u })
-				->setAlignment(mem->getAlignment())
-				->setIsNeeded(false)
-				->setUseIndirection(false);
-			TensorDesc* filledL2Norm = new TensorDesc(mem);
-
-			//6.2.1.: Normalize mem
-			graph->addNode((new Operation_Pointwise()) //Square mem
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
-				->setInTensor(mem)
-				->setOutTensor(mem_squared)
-				->setBlendConstants({ ONE, ZERO })
-			);
-			graph->addNode((new Operation_Reduce()) //Reduce squared mem over spatial dimensions
-				->setReduceType(REDUCE_TYPE::SUM)
-				->setInTensor(mem_squared)
-				->setOutTensor(l2MemNorm)
-				->setReduceDimensions({ 2u,3u,4u })
-				->setBlendConstants({ ONE, ZERO	})
-			);
-			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_ROOT)
-				->setInTensor(l2GradientNorm)
-				->setOutTensor(l2GradientNorm)
-				->setBlendConstants({ ONE, ZERO })
-			);
 			graph->addNode((new Operation_Fill()) //Fill norm
-				->setConstant(l2GradientNorm)
+				->setConstant(l2MemNorm)
 				->setOutTensor(filledL2Norm)
 				->setBlendConstants({ ONE, ZERO })
 			);
@@ -883,14 +1066,14 @@ public:
 			TensorDesc* dotp_unreduced = new TensorDesc(step);
 			TensorDesc* dotp_reduced = new TensorDesc()
 				->setTypeId(this->data_type)
-				->setSize({ step->getSize[0], 1u, 1u, 1u, 1u })
-				->setStrides({ step->getSize[0], 1u, 1u, 1u, 1u })
+				->setSize({ step->getSize()[0], 1u, 1u, 1u, 1u })
+				->setStrides({ step->getSize()[0], 1u, 1u, 1u, 1u })
 				->setAlignment(step->getAlignment())
 				->setIsNeeded(false)
 				->setUseIndirection(false);
 			TensorDesc* dotp_filled = new TensorDesc(step);
 
-			//6.2.2.: Compute dotp
+			//Compute dotp
 			graph->addNode((new Operation_Binary()) //Compute dotp
 				->setBinaryType(BINARY_TYPE::BINARY_MUL)
 				->setInTensors(mem_normalized, step)
@@ -905,7 +1088,7 @@ public:
 				->setBlendConstants({ ONE, ZERO })
 			);
 			graph->addNode((new Operation_Fill()) //Fill dotp
-				->setBlendConstants(dotp_reduced)
+				->setConstant(dotp_reduced)
 				->setOutTensor(dotp_filled)
 				->setBlendConstants({ ONE, ZERO })
 			);
@@ -914,7 +1097,7 @@ public:
 				->setInTensors(dotp_filled, mem_normalized)
 				->setOutTensor(step)
 				->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
+					new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(-1.0),
 					ONE
 				})
 			);
@@ -941,16 +1124,64 @@ public:
 				->setConstant(step_mean)
 				->setOutTensor(step)
 				->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
+					new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(-1.0),
 					ONE
 				})
+			);
+		}
+
+		//6.4.: Normalize
+		if (arg_normalize == NORMALIZE::STEP) {
+			//Compute step norm
+			TensorDesc* step_squared = new TensorDesc(step);
+			TensorDesc* step_normalized = new TensorDesc(step);
+			TensorDesc* l2StepNorm = (new TensorDesc())
+				->setTypeId(this->data_type)
+				->setSize({ step->getSize()[0], step->getSize()[1], 1u, 1u, 1u })
+				->setStrides({ step->getSize()[0] * step->getSize()[1], step->getSize()[1], 1u, 1u, 1u })
+				->setAlignment(step->getAlignment())
+				->setIsNeeded(false)
+				->setUseIndirection(false);
+			graph->addNode((new Operation_Pointwise()) //Square deltas
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+				->setInTensor(deltas)
+				->setOutTensor(step_squared)
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Reduce()) //Reduce squared deltas over spatial dimensions
+				->setReduceType(REDUCE_TYPE::SUM)
+				->setInTensor(step_squared)
+				->setOutTensor(l2StepNorm)
+				->setReduceDimensions({ 2u,3u,4u })
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
+				->setInTensor(l2StepNorm)
+				->setOutTensor(l2StepNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			TensorDesc* factor = new TensorDesc(deltas);
+			graph->addNode((new Operation_Fill()) //Fill norm
+				->setConstant(l2StepNorm)
+				->setOutTensor(factor)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			//Apply
+			graph->addNode((new Operation_Binary())
+				->setBinaryType(BINARY_TYPE::BINARY_DIV)
+				->setInTensors(step, factor)
+				->setOutTensor(step)
+				->setBlendConstants({ ONE, ZERO })
 			);
 		}
 
 		//7.: Update LR buffer
 		if (arg_deltaLr) {
 			graph->addNode((new Operation_Pointwise())
-				->setPointwiseType(POINTWISE_TYPE::SQUARE)
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
 				->setInTensor(step)
 				->setOutTensor(optBufs["deltaLr"])
 				->setBlendConstants({ this->constants["oldStepSizeNew"], this->constants["oldStepSizeDecay"] })
@@ -958,7 +1189,7 @@ public:
 		}
 
 		//8.: Save debug information
-		switch (debug) {
+		switch (arg_debug) {
 		case DEBUG_INFO::NONE:
 			break;
 		case DEBUG_INFO::GRADIENT:
@@ -977,14 +1208,14 @@ public:
 			break;
 		case DEBUG_INFO::MOMENTUM_BUF:
 			graph->addNode((new Operation_Copy())
-				->setInTensor(optBuf["momentum")
+				->setInTensor(optBufs["momentum")
 				->setOutTensor(optBufs["debug"])
 				->setBlendConstants({ ONE, ZERO })
 			);
 			break;
 		case DEBUG_INFO::ADAPTIVE_BUF:
 			graph->addNode((new Operation_Copy())
-				->setInTensor(optBuf["adaptive"])
+				->setInTensor(optBufs["adaptive"])
 				->setOutTensor(optBufs["debug"])
 				->setBlendConstants({ ONE, ZERO })
 			);
@@ -996,7 +1227,7 @@ public:
 			->setInTensor(step)
 			->setOutTensor(mem)
 			->setBlendConstants({
-				new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
+				new ConstantDesc(this->computation_type)->setUseIndirection(false)->setValue(-1.0),
 				ONE
 			})
 		);
@@ -1009,7 +1240,7 @@ public:
 			lookahead_condition->addOperationTrue((new Operation_Binary()) //Update slow weights
 				->setBinaryType(BINARY_TYPE::BINARY_SUB)
 				->setInTensors(mem, optBufs["lookahead"])
-				->setOutTensor(optBuf["lookahead"])
+				->setOutTensor(optBufs["lookahead"])
 				->setBlendConstants({
 					this->constants["lookaheadStepSize"],
 					ONE
@@ -1022,84 +1253,124 @@ public:
 			);
 			graph->addNode(lookahead_condition);
 		}
+	
+		//11.: Weight normalization
+		if (arg_normalize == NORMALIZE::WEIGHT || (arg_normalize == NORMALIZE::WEIGHT_SCALEINV && scaleInvariant) || (arg_normalize == NORMALIZE::WEIGHT_NOT_SCALEINV && !scaleInvariant)) {
+			TensorDesc* mem_squared = new TensorDesc(mem);
+			TensorDesc* mem_normalized = new TensorDesc(mem);
+			graph->addNode((new Operation_Pointwise()) //Square mem
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
+				->setInTensor(mem)
+				->setOutTensor(mem_squared)
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Reduce()) //Reduce squared mem over spatial dimensions
+				->setReduceType(REDUCE_TYPE::SUM)
+				->setInTensor(mem_squared)
+				->setOutTensor(l2MemNorm)
+				->setReduceDimensions({ 2u,3u,4u })
+				->setBlendConstants({ ONE, ZERO })
+			);
+			graph->addNode((new Operation_Pointwise()) //Root the l2 norm
+				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQRT)
+				->setInTensor(l2MemNorm)
+				->setOutTensor(l2MemNorm)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			TensorDesc* factor = new TensorDesc(deltas);
+			graph->addNode((new Operation_Fill()) //Fill norm
+				->setConstant(l2MemNorm)
+				->setOutTensor(factor)
+				->setBlendConstants({ ONE, ZERO })
+			);
+
+			//Apply
+			graph->addNode((new Operation_Binary())
+				->setBinaryType(BINARY_TYPE::BINARY_DIV)
+				->setInTensors(mem, factor)
+				->setOutTensor(mem)
+				->setBlendConstants({ ONE, ZERO })
+			);
+		}
 	}
 	
 	virtual void recalculateGpuConstants() override {
 		//1.: Which constants can be inlined?
-		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_debias));
+		bool momentumNeedFactor = ((arg_momentum == MOMENTUM::NESTROV) || (arg_momentum == MOMENTUM::VANILLA && arg_deBias));
 		bool momentumHasFactor = momentumNeedFactor;
 
-		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_debias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
+		bool adaptiveNeedFactor = (arg_adaptive != ADAPTIVE::NONE) && (arg_deBias != DEBIAS::NONE || arg_rectify != RECTIFY::NONE || arg_momentum == MOMENTUM::NESTROV);
 		bool adaptiveNeedInnerFactor = adaptiveNeedFactor && arg_boundAdaptive;
 		bool adaptiveHasInnerFactor = adaptiveNeedInnerFactor;
 		bool adaptiveHasOuterFactor = !adaptiveNeedInnerFactor && adaptiveNeedFactor && !momentumHasFactor;
 		bool adaptiveHasFactor = adaptiveHasInnerFactor || adaptiveHasOuterFactor;
 		bool inlineAdaptive = adaptiveNeedFactor && !adaptiveHasFactor;
 
-		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor);
+		bool inlineStepSize = !arg_deltaLr && (momentumHasFactor || adaptiveHasOuterFactor) && !(arg_normalize == NORMALIZE::GRADIENT_LAMB || arg_normalize == NORMALIZE::GRADIENT_LARS || arg_normalize == NORMALIZE::STEP_LAMB || arg_normalize == NORMALIZE::STEP_LARS);
 
 		//2.: Update Exponential Moving Average Constants
 		if (arg_momentum != MOMENTUM::NONE) {
-			this->constants["momentumNew"]     ->setValue(momentumNew  );
-			this->constants["momentumDecay"]   ->setValue(momentumDecay);
+			this->constants["momentumNew"     ]->setValue(this->hyperparams["momentumNew"  ]);
+			this->constants["momentumDecay"   ]->setValue(this->hyperparams["momentumDecay"]);
 		}
 		if (arg_adaptive != ADAPTIVE::NONE) {
-			this->constants["adaptiveNew"]     ->setValue(adaptiveNew  );
-			this->constants["adaptiveDecay"]   ->setValue(adaptiveDecay);
+			this->constants["adaptiveNew"     ]->setValue(this->hyperparams["adaptiveNew"  ]);
+			this->constants["adaptiveDecay"   ]->setValue(this->hyperparams["adaptiveDecay"]);
 		}
 		if (arg_deltaLr) {
-			this->constants["oldStepSizeNew"]  ->setValue(deltaNew     );
-			this->constants["oldStepSizeDecay"]->setValue(deltaDecay   );
+			this->constants["oldStepSizeNew"  ]->setValue(this->hyperparams["deltaNew"     ]);
+			this->constants["oldStepSizeDecay"]->setValue(this->hyperparams["deltaDecay"   ]);
 		}
 		
 		//3.: Set weight decay
 		switch (arg_decay & ~0b11) {
 		case WEIGHT_DECAY::GRAD_PLAIN:
 		case WEIGHT_DECAY::STEP_PLAIN:
-			this->constants["weightDecay"]->setValue(weightDecay);
+			this->constants["weightDecay"]->setValue(this->hyperparams["weightDecay"]);
 			break;
 		case WEIGHT_DECAY::GRAD_VANILLA_LR:
 			if (arg_deltaLr)
-				this->constants["weightDecay"]->setValue(weightDecay);
+				this->constants["weightDecay"]->setValue(this->hyperparams["weightDecay"]);
 			else 
-				this->constants["weightDecay"]->setValue(weightDecay * stepSize);
+				this->constants["weightDecay"]->setValue(this->hyperparams["weightDecay"] * this->hyperparams["stepSize"]);
 			break;
 		case WEIGHT_DECAY::STEP_VANILLA_LR:
 		case WEIGHT_DECAY::STEP_EFFECTIVE_LR:
 		case WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN:
 			if (inlineStepSize)
-				this->constants["weightDecay"]->setValue(weightDecay * stepSize);
+				this->constants["weightDecay"]->setValue(this->hyperparams["weightDecay"] * this->hyperparams["stepSize"]);
 			else
-				this->constants["weightDecay"]->setValue(weightDecay);
+				this->constants["weightDecay"]->setValue(this->hyperparams["weightDecay"]);
 		}
 
 		//4.: Set clipping and bounding
 		if (arg_clipping) {
-			this->constants["clippingMin"]->setValue(clippingMin);
-			this->constants["clippingMin"]->setValue(clippingMax);
+			this->constants["clippingMin"]->setValue(this->hyperparams["clippingMin"]);
+			this->constants["clippingMin"]->setValue(this->hyperparams["clippingMax"]);
 		}
 		if (arg_boundAdaptive) {
-			this->constants["adaptiveBoundMin"]->setValue(boundMin);
-			this->constants["adaptiveBoundMin"]->setValue(boundMax);
+			this->constants["adaptiveBoundMin"]->setValue(this->hyperparams["boundMin"]);
+			this->constants["adaptiveBoundMin"]->setValue(this->hyperparams["boundMax"]);
 		}
 
-		//5.: Set debiasing constants (these might not all be needed but those that are will be set to the right value)
-		T momentumFac = (T)1;
-		T nestrovFac  = (T)1;
-		T adaptiveFac = (T)1;
+		//5.: Set debiasing constants (these might not all be needed but those that are will be set to the right value - all unneeded factors will have random value)
+		double momentumFac = 1.;
+		double nestrovFac  = 1.;
+		double adaptiveFac = 1.;
 
 		//5.1.: Compute adaptive factor
 		if (adaptiveNeedFactor) { //Own factor
-			switch (arg_debias) {
+			switch (arg_deBias) {
 			case DEBIAS::NONE:
 				break;
 			case DEBIAS::APPROX:
-				adaptiveFac /= (T)1 - pow(adaptiveDecay, timeStep);
+				adaptiveFac /= 1. - pow(this->hyperparams["adaptiveDecay"], this->hyperparams["timeStep"]);
 				break;
 			case DEBIAS::EXACT:
-				static T adaprod = (T)1;
-				adaprod *= adaptiveDecay;
-				adaptiveFac /= (T)1 - adaprod;
+				static double adaprod = 1.;
+				adaprod *= this->hyperparams["adaptiveDecay"];
+				adaptiveFac /= 1. - adaprod;
 				break;
 			}
 
@@ -1108,26 +1379,26 @@ public:
 			case RECTIFY::NONE:
 				break;
 			case RECTIFY::APPROX:
-				T rho_inf = (T)2 / adaptiveNew - (T)1;
-				T rho_t = rho_inf - (T)2 * timeStep * pow(adaptiveDecay, timeStep) / ((T)1 - pow(adaptiveDecay, timeStep));
-				this->constants["rectificationBool"]->setValue(rho_t > (T)4);
-				adaptiveFac *= ((rho_inf - (T)4) * (rhi_inf - (T)2) * rho_t) / ((rho_t - (T)4) * (rho_t - (T)2) * (rho_inf));
+				double rho_inf = 2. / this->hyperparams["adaptiveNew"] - 1.;
+				double rho_t = rho_inf - 2. * this->hyperparams["timeStep"] * pow(this->hyperparams["adaptiveDecay"], this->hyperparams["timeStep"]) / (1. - pow(this->hyperparams["adaptiveDecay"], this->hyperparams["timeStep"]));
+				this->constants["rectificationBool"]->setValue(rho_t > 4.);
+				adaptiveFac *= ((rho_inf - 4.) * (rho_inf - 2.) * rho_t) / ((rho_t - 4.) * (rho_t - 2.) * (rho_inf));
 				break;
 			case RECTIFY::EXACT:
-				T rho_inf = (T)2 / adaptiveNew - (T)1;
-				static T adaprod = (T)1;
-				adaprod *= adaptiveDecay;
-				T rho_t = rho_inf - (T)2 * timeStep * adaprod / ((T)1 - adaprod);
-				this->constants["rectificationBool"]->setValue(rho_t > (T)4);
-				adaptiveFac *= ((rho_inf - (T)4) * (rhi_inf - (T)2) * rho_t) / ((rho_t - (T)4) * (rho_t - (T)2) * (rho_inf));
+				double rho_inf = 2. / this->hyperparams["adaptiveNew"] - 1.;
+				static double adaprod = 1.;
+				adaprod *= this->hyperparams["adaptiveDecay"];
+				double rho_t = rho_inf - 2. * this->hyperparams["timeStep"] * adaprod / (1. - adaprod);
+				this->constants["rectificationBool"]->setValue(rho_t > 4.);
+				adaptiveFac *= ((rho_inf - 4.) * (rho_inf - 2.) * rho_t) / ((rho_t - 4.) * (rho_t - 2.) * (rho_inf));
 				break;
 			}
 
 			if (arg_momentum == MOMENTUM::NESTROV)
-				adaptiveFac *= adaptiveDecay;
+				adaptiveFac *= this->hyperparams["adaptiveDecay"];
 		}
 		if (adaptiveHasOuterFactor && inlineStepSize) //Inline step size
-			adaptiveFac *= stepSize;
+			adaptiveFac *= this->hyperparams["stepSize"];
 
 		//5.2.: Compute momentum factors
 		//Own factor
@@ -1135,35 +1406,35 @@ public:
 		case MOMENTUM::NONE:
 			break;
 		case MOMENTUM::NESTROV:
-			momentumFac *= momentumDecayNext;
-			nestrovFac *= momentumNew;
+			momentumFac *= this->hyperparams["momentumDecayNext"];
+			nestrovFac *= this->hyperparams["momentumNew"];
 
-			switch (arg_debias) {
+			switch (arg_deBias) {
 			case DEBIAS::NONE:
 				break;
 			case DEBIAS::APPROX:
-				T tmp = pow(momentumDecay, timeStep);
-				momentumFac /= (T)1 - tmp * momentumDecay;
-				nestrovFac  /= (T)1 - tmp;
+				double tmp = pow(this->hyperparams["momentumDecay"], this->hyperparams["timeStep"]);
+				momentumFac /= 1. - tmp * this->hyperparams["momentumDecay"];
+				nestrovFac  /= 1. - tmp;
 				break;
 			case DEBIAS::EXACT:
-				static T momProd = (T)1;
-				momProd *= momentumDecay;
-				momentumFac /= (T)1 - momProd * momentumDecayNext;
-				nestrovFac  /= (T)1 - momProd;
+				static double momProd = 1.;
+				momProd *= this->hyperparams["momentumDecay"];
+				momentumFac /= 1. - momProd * this->hyperparams["momentumDecayNext"];
+				nestrovFac  /= 1. - momProd;
 				break;
 			}
 		case MOMENTUM::VANILLA:
-			switch (arg_debias) {
+			switch (arg_deBias) {
 			case DEBIAS::NONE:
 				break;
 			case DEBIAS::APPROX:
-				momentumFac /= (T)1 - pow(momentumDecay, timeStep);
+				momentumFac /= 1. - pow(this->hyperparams["momentumDecay"], this->hyperparams["timeStep"]);
 				break;
 			case DEBIAS::EXACT:
-				static T momProd = (T)1;
-				momProd *= momentumDecay;
-				momentumFac /= (T)1 - momProd;
+				static double momProd = 1.;
+				momProd *= this->hyperparams["momentumDecay"];
+				momentumFac /= 1. - momProd;
 				break;
 			}
 		}
@@ -1174,7 +1445,7 @@ public:
 				momentumFac *= pow(adaptiveFac, -1./2.);
 				nestrovFac  *= pow(adaptiveFac, -1./2.);
 				break;
-			case ADAPTIVE:CBRT:
+			case ADAPTIVE::CBRT:
 				momentumFac *= pow(adaptiveFac, -1./3.);
 				nestrovFac  *= pow(adaptiveFac, -1./3.);
 				break;
@@ -1182,8 +1453,8 @@ public:
 		}
 
 		if (inlineStepSize) { //Inline step size
-			momentumFac *= stepSize;
-			nestrovFac  *= stepSize;
+			momentumFac *= this->hyperparams["stepSize"];
+			nestrovFac  *= this->hyperparams["stepSize"];
 		}
 
 		//5.3.: Set factors
@@ -1194,860 +1465,26 @@ public:
 		if (adaptiveHasFactor)
 			this->constants["adaptiveDebias"]->setValue(adaptiveFac);
 		if (!inlineStepSize && !arg_deltaLr) 
-			this->constants["stepSize"]->setValue(stepSize);
+			this->constants["stepSize"]->setValue(this->hyperparams["stepSize"]);
 	
 		//6.: Epsilon
-		if (adaptive != ADAPTIVE::NONE)
-			this->constants["epsilon"]->setValue(epsilon);
+		if (arg_adaptive != ADAPTIVE::NONE)
+			this->constants["epsilon"]->setValue(this->hyperparams["epsilon"]);
 
 		//7.: Lookahead
 		if (arg_lookahead > 0u) {
-			static stepsUntilSync = arg_lookahead;
+			static uint32_t stepsUntilSync = arg_lookahead;
 			if (stepsUntilSync == 0) {
 				stepsUntilSync = arg_lookahead;
-				this->constants["lookaheadSyncBool"].setValue(1);
+				this->constants["lookaheadSyncBool"]->setValue(1);
 			}
 			else {
-				this->constants["lookaheadSyncBool"].setValue(0);
-				stepsUtilSync--;
+				this->constants["lookaheadSyncBool"]->setValue(0);
+				stepsUntilSync--;
 			}
 		}
 	}
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-template<
-	MOMENTUM momentum         = MOMENTUM::NESTROV,
-	ADAPTIVE adaptive         = ADAPTIVE::NONE,
-	WEIGHT_DECAY decay        = WEIGHT_DECAY::L2 ^ WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN,
-	CLIPPING clipping         = CLIPPING::GRADIENT, 
-	DEBIAS de_bias            = DEBIAS::NONE, 
-	CENTRALIZATION centralize = CENTRALIZATION::GRADIENT,
-	uint32_t lookahead        = 0u,
-	bool delta_lr             = false,
-	bool projection           = true,
-	DEBUG_INFO debug          = DEBUG_INFO::NONE
->
-class FirstOrder_Optimizer : public Optimizer {
-	//constants (all indirection)
-	constexpr uint32_t stepNumber_idx        = 0;                                                       //The number of optimization step
-	constexpr uint32_t stepSize_idx          = stepNumber_idx        + (debias != DEBIAS::NONE);        //The learning rate / step size
-	constexpr uint32_t epsilon_idx           = stepSize_idx          + (!delta_lr);                     //Small constant for numeric stability
-	constexpr uint32_t momentumDecay_idx     = epsilon_idx           + 1;                               //m_{n+1} = (momentumDecay) * m_n + (momentumNew) * g_n
-	constexpr uint32_t momentumDecayNext_idx = momentumDecay_idx     + (momentum != MOMENTUM::NONE);    //The momentumDecay of the next timestep
-	constexpr uint32_t momentumNew_idx       = momentumDecayNext_idx + (momentum != MOMENTUM::NESTROV); //m_{n+1} = (momentumDecay) * m_n + (momentumNew) * g_n
-	constexpr uint32_t momentumNewNext_idx   = momentumNew_idx       + (momentum != MOMENTUM::NONE);    //The momentumNew of the next timestep
-	constexpr uint32_t momentumDebias_idx    = momentumNewNext_idx   + (momentum != MOMENTUM::NESTROV); //The factor needed to debias momentum. If adaptive is also activated and weight decay is not EFFECTIVE_LR_MEAN, this factor can be fused with adaptiveDebias
-	constexpr uint32_t momentumNestrov_idx   = momentumDebias_idx    + (momentum != MOMENTUM::NONE && 
-		debias != DEBIAS::NONE);	                                                                    //momentumNex/1-momentumDecay^t, used for nestrov momentum
-	constexpr uint32_t adaptiveDecay_idx     = momentumNestrov_idx   + (momentum == MOMENTUM::NESTROV); //a_{n+1} = (adaptiveDecay) * a_n + (adaptiveNew) * (g_n)^2
-	constexpr uint32_t adaptiveNew_idx       = adaptiveDecay_idx     + (adaptive != ADAPTIVE::NONE);    //a_{n+1} = (adaptiveDecay) * a_n + (adaptiveNew) * (g_n)^2
-	constexpr uint32_t adaptiveDebias_idx    = adaptiveNew_idx       + (adaptive != ADAPTIVE::NONE);    //The factor needed to debias adaptive. If momentum is also activated and weight decay os not EFFECTIVE_LR_MEAN, this factor is not needed as it is fused with momentumDebias
-	constexpr uint32_t oldStepsDecay_idx     = adaptiveDebias_idx    + (adaptive != ADAPTIVE::NONE && 
-		debias != DEBIAS::NONE && (momemtum == MOMENTUM::NONE || decay == WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN));        //s_{n+1} = (oldStepsDecay) * s_n + (oldStepsNew) * step_n
-	constexpr uint32_t oldStepNew_idx        = oldStepsDecay_idx     + (delta_lr);                      //s_{n+1} = (oldStepsDecay) * s_n + (oldStepsNew) * step_n
-	constexpr uint32_t lookaheadSyncBool_idx = oldStepNew_idx        + (delta_lr);                      //1 if synching and slow weight update has to occur, 0 otherwise
-	constexpr uint32_t lookaheadStepSize_idx = lookaheadSyncBool_idx + (lookahead > 0u);                //LR for slow weight synchronization. Negative.
-	constexpr uint32_t clippingMin_idx       = lookaheadStepSize_idx + (lookahead > 0u);                //The minimum value to clip gradient/step to
-	constexpr uint32_t clippingMax_idx       = clippingMin           + (clipping != CLIPPING::NONE);    //The maximum value to clip gradient/step to
-	constexpr uint32_t decayRate_idx         = clippingMax_idx       + (clipping != CLIPPING::NONE);    //The weight decay rate, already multiplied with lr if GRAD_VANILLA_LR. Negative if STEP_PLAIN. (w -= decayRateNeg * f(w), f(x)=x oder f(x)=sgn(x))
-
-	//optBufs
-	constexpr uint32_t momentum_idx  = 0;
-	constexpr uint32_t adaptive_idx  = momentum_idx  + (momentum != MOMENTUM::NONE);
-	constexpr uint32_t lookahead_idx = adaptive_idx  + (adaptive != ADAPTIVE::NONE); //The slow weights
-	constexpr uint32_t delta_idx     = lookahead_idx + (lookahead > 0u            );
-	constexpr uint32_t debug_idx     = delta_idx     + (delta_idx);
-
-public:
-	FirstOrder_Optimizer(TYPE data_type, TYPE computation_type)
-	{
-		//0.: Check consistency
-		if (debug == DEBUG_INFO::MOMENTUM_BUF && momentum == MOMENTUM::NONE) {
-			fprintf(stderr, "[ERROR] Optimizer can't save momentum buffer if no momentum is used! (File %s, Line %d)\n", __FILE__, __LINE__);
-			std::exit(-1);
-		}
-		if (debug == DEBUG_INFO::ADAPTIVE_BUF && adaptive == ADAPTIVE::NONE) {
-			fprintf(stderr, "[ERROR] Optimizer can't save adaptive buffer if no adaptivity is used! (File %s, Line %d)\n", __FILE__, __LINE__);
-			std::exit(-1);
-		}
-		
-
-		//TODO
-		this->data_type = data_type;
-		this->computation_type = computation_type;
-
-		this->optBuffers = std::vector<TensorDesc*>();
-		this->constants = std::vector<ConstantDesc*>();
-
-		this->constants.push_back(new ConstantDesc(this->data_type)->setUseIndirection(true));   //-Alpha
-	}
-
-	//TODO: Centralize/decay mean over C-dimension?
-	//TODO: Decay EFFECTIVE_LR_MEAN uses mean(sqrt(v)) instead of sqrt(mean(v)) which is not equivalent!
-	//TODO: Fuse bias and nestrov
-	//TODO: line search
-	virtual void applyDeltaToMemory(OperationGraph* graph, TensorDesc* mem, TensorDesc* deltas, bool scaleInvariant = false) override {
-		//0.: Check input
-		if (this->data_type != mem->getTypeId())    throw new std::runtime_error("[ERROR] Optimizer requires memory to be of the previously specified data type");
-		if (this->data_type != deltas->getTypeId()) throw new std::runtime_error("[ERROR] Optimizer requires deltas to be of the previously specified data type");
-
-		//1.: Get associated buffers
-		auto associatedBufs_p = this->optBuffers.find(mem);
-		std::vector<TensorDesc*> associatedBufs;
-		if (associatedBufs_p == this->optBuffers.end()) {
-			associatedBufs = std::vector<TensorDesc*>();
-			if (momentum != MOMENTUM::NONE)	associatedBufs.push_back(new TensorDesc(mem)->setIsNeeded(true));
-			if (adaptive != ADAPTIVE::NONE) associatedBufs.push_back(new TensorDesc(mem)->setIsNeeded(true));
-			if (lookahead                 ) associatedBufs.push_back(new TensorDesc(mem)->setIsNeeded(true));
-			if (delta_lr                  ) associatedBufs.push_back(new TensorDesc(mem)->setIsNeeded(true));
-			if (debug                     ) associatedBufs.push_back(new TensorDesc(mem)->setIsNeeded(true));
-			this->optBuffers[mem] = associatedBufs;
-		}
-		else
-			associatedBufs = associatedBufs_p->second;
-
-		//2.: Regularization pre update
-		//2.1: Clipping
-		if constexpr (clipping == CLIPPING::GRADIENT) {
-			Operation_Pointwise* clip = new Operation_Pointwise()
-				->setInTensor(deltas)
-				->setOutTensor(deltas)
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_CLIP)
-				->setArgument({ this->constants[clippingMin_idx], this->constants[clippingMax_idx] })
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(clip);
-		}
-
-		//2.2.: Weight decay
-		if constexpr ((decay >> 2) == WEIGHT_DECAY::GRAD_PLAIN || (decay >> 2) == WEIGHT_DECAY::GRAD_VANILLA_LR) {
-			if constexpr (decay & WEIGHT_DECAY::L1) {
-				Operation_Pointwise* l1_reg = new Operation_Pointwise()
-					->setInTensor(mem)
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
-					->setOutTensor(delta)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l1_reg);
-			}
-			else if constexpr (decay & WEIGHT_DECAY::L2) {
-				Operation_Copy* l2_reg = new Operation_Copy()
-					->setInTensor(mem)
-					->setOutTensor(delta)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l2_reg);
-			}
-			else {
-				fprintf(stderr, "[ERROR] If weight decay is used, it must be either L1 or L2! (File %s, Line %d)\n", __FILE__, __LINE__);
-				std::exit(-1);
-			}
-		}
-
-		if constexpr ((decay >> 2) == WEIGHT_DECAY::STEP_PLAIN) {
-			if constexpr (decay & WEIGHT_DECAY::L1) {
-				Operation_Pointwise* l1_reg = new Operation_Pointwise()
-					->setInTensor(mem)
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
-					->setOutTensor(mem)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l1_reg);
-			}
-			else if constexpr (decay & WEIGHT_DECAY::L2) {
-				Operation_Copy* l2_reg = new Operation_Copy()
-					->setInTensor(mem)
-					->setOutTensor(mem)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l2_reg);
-			}
-			else {
-				fprintf(stderr, "[ERROR] If weight decay is used, it must be either L1 or L2! (File %s, Line %d)\n", __FILE__, __LINE__);
-				std::exit(-1);
-			}
-		}
-
-		//2.3.: Centralization
-		if constexpr (centralize == CENTRALIZATION::GRADIENT) {
-			TensorDesc* gradient_mean = new TensorDesc()
-				->setTypeId(this->data_type)
-				->setSize({ deltas->getSize[0], 1u, 1u, 1u, 1u })
-				->setStrides({ deltas->getSize[0], 1u, 1u, 1u, 1u })
-				->setAlignment(deltas->getAlignment())
-				->setIsNeeded(false)
-				->setUseIndirection(false);
-			Operation_Reduce* computeMean = new Operation_Reduce()
-				->setInTensor(deltas)
-				->setOutTensor(gradient_mean)
-				->setReduceDimensions({ 2u,3u,4u }) //All spacial dimension
-				->setReduceType(REDUCE_TYPE::MEAN)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			Operation_Bias* gradientShift = new Operation_Bias()
-				->setInTensors(deltas, gradient_mean)
-				->setOutTensor(deltas)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-					});
-			graph->addNode(computeMean);
-			graph->addNode(gradientShift);
-		}
-
-		//3.: Update gradient buffers
-		//3.1.: Momentum buffer
-		Operation_Copy* momentumUpd;
-		if constexpr (momentum != Momentum::NONE){
-			Operation_Copy momentumUpd = new Operation_Copy()
-				->setInTensor(deltas)
-				->setOutTensor(associatedBufs[momentum_idx])
-				->setBlendConstants({ this->constants[momentumNew_idx], this->constants[momentumDecay_idx] });
-			graph->addNode(momentumUpd);
-			break;
-		}
-
-		//3.2.: Adaptive buffer
-		if constexpr (adaptive != ADAPTIVE::NONE) {
-			Operation_Pointwise* gradientSquare = new Operation_Pointwise()
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
-				->setInTensor(deltas)
-				->setOutTensor(associatedBufs[adaptive_idx])
-				->setBlendConstants({ this->constants[adaptiveNew_idx], this->constants[adaptiveDecay_idx] });
-			graph->addNode(gradient)
-			break;
-		}
-		
-		//4.: Debias
-		//If no debiasing is occuring, just copy tensor over.
-		TensorDesc* momentum_debiased;
-		TensorDesc* adaptive_debiased; 
-		if constexpr (momentum != MOMENTUM::NONE) momentum_debiased = new TensorDesc(associatedBufs[momentum_idx]);
-		if constexpr (adaptive != ADAPTIVE::NONE) adaptive_debiased = new TensorDesc(associatedBufs[adaptive_idx]);
-		
-		if constexpr (debias == DEBIAS::NONE) {
-			//Move momentum
-			if (momentum != MOMENTUM::NONE) {
-				Operation_Copy* moveMomentum = new Operation_Copy()
-					->setInTensor(associatedBufs[momentum_idx])
-					->setOutTensor(momentum_debiased)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(moveMomentum);
-			}
-
-			//Move adaptive
-			if (adaptive != ADAPTIVE::NONE) {
-				Operation_Copy* moveAdaptive = new Operation_Copy()
-					->setInTensor(associatedBufs[adaptive_idx])
-					->setOutTensor(adaptive_debiased)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(moveAdaptive);
-			}
-		}
-		else {
-			//Momentum
-			if (momentum != MOMENTUM::NONE) {
-				Operation_Pointwise debiasMometum = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_MUL)
-					->setInTensor(associatedBufs[momentum_idx])
-					->setOutTensor(momentum_debiased)
-					->setArgument(this->constants[momentumDebias_idx])
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(debiasMometum);
-			}
-
-			//Adaptive
-			if (adaptive != ADAPTIVE::NONE) {
-				if (momentum != MOMENTUM::NONE && decay != WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN) {
-					//Operation is not needed, as it is fused with momentum debias
-					Operation_Copy* moveAdaptive = new Operation_Copy()
-						->setInTensor(associatedBufs[adaptive_idx])
-						->setOutTensor(adaptive_debiased)
-						->setBlendConstants({
-								new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-								new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-							});
-					graph->addNode(moveAdaptive);
-				}
-				else {
-					//Debiasing needed
-					Operation_Pointwise debiasAdaptive = new Operation_Pointwise()
-						->setPointwiseType(POINTWISE_TYPE::POINTWISE_MUL)
-						->setInTensor(associatedBufs[adaptive_idx])
-						->setOutTensor(adaptive_debiased)
-						->setArgument(this->constants[adaptiveDebias_idx])
-						->setBlendConstants({
-								new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-								new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-							});
-					graph->addNode(debiasAdaptive);
-				}
-			}
-		}
-		
-		//5.: Build step buffer
-		TensorDesc* step = new TensorDesc(mem); //This holds the step every weights is moved in (actually this is the value that will be subtracted from every weight)
-
-		//5.1: Set gradient/momentum
-		switch (momentum) {
-		case MOMENTUM::NONE:
-			Operation_Binary* setGradient = new Operation_Binary()
-				->setBinaryType(BINARY_TYPE::BINARY_MUL)
-				->setInTensors(step, deltas)
-				->setOutTensor(step)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(setGradient);
-			break;
-
-		case MOMENTUM::NESTROV:
-			//TODO: Fuse with debias
-			Operation_Copy* nestrovGradient = new Operation_Copy()
-				->setInTensor(deltas)
-				->setOutTensor(momentum_debiased)
-				->setBlendConstants({
-						this->constants[momentumNestrov_idx],
-						this->constants[momentumDecayNext_idx]
-					});
-			Operation_Pointwise* nestrovAdaptive = new Operation_Pointwise()
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_MUL)
-				->setInTensor(adaptive_debiased)
-				->setArgument({ this->constants[momentumNewNext_idx] })
-				->setOutTensor(adaptive_debiased)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(nestrovGradient);
-			graph->addNode(nestrovAdaptive);
-		case MOMENTUM::VANILLA:
-			Operation_Binary* setMomentum = new Operation_Binary()
-				->setInTensors(step, momentum_debiased)
-				->setOutTensor(step)
-				->setBinaryType(BINARY_TYPE::BINARY_MUL)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(setMomentum);
-
-			break;
-		}
-		
-		//5.2.: Effective lr decay
-		if constexpr ((decay >> 2) == WEIGHT_DECAY::STEP_EFFECTIVE_LR) {			
-			if constexpr (decay & WEIGHT_DECAY::L1) {
-				Operation_Pointwise* l1_reg = new Operation_Pointwise()
-					->setInTensor(mem)
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
-					->setOutTensor(step)
-					->setBlendConstants({
-							-this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l1_reg);
-			}
-			else if constexpr (decay & WEIGHT_DECAY::L2) {
-				Operation_Copy* l2_reg = new Operation_Copy()
-					->setInTensor(mem)
-					->setOutTensor(step)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l2_reg);
-			}
-			else {
-				fprintf(stderr, "[ERROR] If weight decay is used, it must be either L1 or L2! (File %s, Line %d)\n", __FILE__, __LINE__);
-				std::exit(-1);
-			}
-		}
-		
-		//5.3.: Compute adaptive lr
-		TensorDesc* adaptiveMultiplier  = new TensorDesc(adaptive_debiased);
-		switch (adaptive) {
-		case ADAPTIVE::NONE:
-			break;
-		case ADAPTIVE::SQRT:
-			{
-				Operation_Pointwise* addEpsilon = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_ADD)
-					->setInTensor(adaptive_debiased)
-					->setOutTensor(adaptive_debiased)
-					->setArgument(this->constants[epsilon_idx])
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Pointwise* adaptivelr = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_ROOT_REC)
-					->setInTensor(adaptive_debiased)
-					->setOutTensor(adaptiveMultiplier)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Binary* mulAdaptive = new Operation_Binary()
-					->setBinaryTypesetBinaryType(BINARY_TYPE::BINARY_MUL)
-					->setInTensors(adaptiveMultiplier, step)
-					->setOutTensor(step)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(addEpsilon);
-				graph->addNode(adaptivelr);
-				graph->addNode(mulAdaptive);
-			}
-			break;
-		case ADAPTIVE::CBRT:
-			{
-				Operation_Pointwise* addEpsilon = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_ADD)
-					->setInTensor(adaptive_debiased)
-					->setOutTensor(adaptive_debiased)
-					->setArgument(this->constants[epsilon_idx])
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-			
-				Operation_Pointwise* adaptivelr = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_POW)
-					->setInTensor(adaptive_debiased)
-					->setOutTensor(adaptiveMultiplier)
-					->setArgument({ new ConstantDesc()->setUseIndirection(false)->setValue(-1.0 / 3.0) })
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Binary* mulAdaptive = new Operation_Binary()
-					->setBinaryType(BINARY_TYPE::BINARY_MUL)
-					->setInTensors(adaptiveMultiplier, step)
-					->setOutTensor(step)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(addEpsilon);
-				graph->addNode(adaptivelr);
-				graph->addNode(mulAdaptive);
-			}
-			break;
-		}
-
-		//5.4.: Effective lr mean & vanilla lr decay
-		if constexpr ((decay >> 2) == WEIGHT_DECAY::STEP_VANILLA_LR || 
-			((decay >> 2) == WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN && adaptive == ADAPTIVE::NONE)) {
-			if constexpr (decay & WEIGHT_DECAY::L1) {
-				Operation_Pointwise* l1_reg = new Operation_Pointwise()
-					->setInTensor(mem)
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
-					->setOutTensor(step)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l1_reg);
-			}
-			else if constexpr (decay & WEIGHT_DECAY::L2) {
-				Operation_Copy* l2_reg = new Operation_Copy()
-					->setInTensor(mem)
-					->setOutTensor(step)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-						});
-				graph->addNode(l2_reg);
-			}
-			else {
-				fprintf(stderr, "[ERROR] If weight decay is used, it must be either L1 or L2! (File %s, Line %d)\n", __FILE__, __LINE__);
-				std::exit(-1);
-			}
-		}
-		else if constexpr ((decay >> 2) == WEIGHT_DECAY::STEP_EFFECTIVE_LR_MEAN) {
-			TensorDesc* adaptiveMean = new TensorDesc()
-				->setTypeId(this->data_type)
-				->setSize({ adaptiveMultiplier->getSize[0], 1u, 1u, 1u, 1u })
-				->setStrides({ adaptiveMultiplier->getSize[0], 1u, 1u, 1u, 1u })
-				->setAlignment(adaptiveMultiplier->getAlignment())
-				->setIsNeeded(false)
-				->setUseIndirection(false);
-			TensorDesc* adaptiveMeanFilled = new TensorDesc(adaptiveMultiplier);
-			TensorDesc* decay_rates        = new TensorDesc(step);
-
-			Operation_Reduce* computeMean = new Operation_Reduce()
-				->setInTensor(adaptiveMultiplier)
-				->setOutTensor(adaptiveMean)
-				->setReduceDimensions({ 2u,3u,4u }) //All spatial dimensions
-				->setReduceType(REDUCE_TYPE::MEAN)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			Operation_Fill* fillMean = new Operation_Fill()
-				->setConstant(adaptiveMean)
-				->setOutTensor(adaptiveMeanFilled)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0),
-					});
-			graph->addNode(computeMean);
-			graph->addNode(fillMean);
-
-			if constexpr (decay & WEIGHT_DECAY::L1) {
-				Operation_Pointwise* l1_reg = new Operation_Pointwise()
-					->setInTensor(mem)
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SIGN)
-					->setOutTensor(decay_rates)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(l1_reg);
-			}
-			else if constexpr (decay & WEIGHT_DECAY::L2) {
-				Operation_Copy* l2_reg = new Operation_Copy()
-					->setInTensor(mem)
-					->setOutTensor(decay_rates)
-					->setBlendConstants({
-							this->constants[decayRate_idx],
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				graph->addNode(l2_reg);
-			}
-			else {
-				fprintf(stderr, "[ERROR] If weight decay is used, it must be either L1 or L2! (File %s, Line %d)\n", __FILE__, __LINE__);
-				std::exit(-1);
-			}
-
-			Operation_Binary* applyDecay = new Operation_Binary()
-				->setBinaryType(BINARY_TYPE::BINARY_MUL)
-				->setInTensors(decay_rates, adaptiveMeanFilled)
-				->setOutTensor(step)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-					});
-			graph->addNode(applyDecay);
-		}
-
-		//5.5.: Set stepsize
-		if constexpr (delta_lr) {
-			Operation_Copy* setLr = new Operation_Copy()
-				->setInTensor(associatedBufs[delta_idx])
-				->setOutTensor(step)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(setLr);
-		}
-		else {
-			Operation_Fill* setLr = new Operation_Fill()
-				->setConstant(this->constants[stepSize_idx])
-				->setOutTensor(step)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(setLr);
-		}
-		
-		//6.: Regularize step
-		//6.1: Clipping
-		if constexpr (clipping == CLIPPING::STEP) {
-			Operation_Pointwise* clip = new Operation_Pointwise()
-				->setPointwiseType(POINTWISE_TYPE::POINTWISE_CLIP)
-				->setInTensor(step)
-				->setOutTensor(step)
-				->setArgument({ this->constants[clippingMin_idx], this->constants[clippingMax_idx] })
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(clip);
-		}
-
-		//6.2.: Projection into tangent space
-		if constexpr (projection) {
-			if (scaleInvariant) {
-				//Compute effective weights
-				TensorDesc* mem_squared    = new TensorDesc(mem);
-				TensorDesc* mem_normalized = new TensorDesc(mem);
-				TensorDesc* l2GradientNorm = new TensorDesc()
-					->setTypeId(this->data_type)
-					->setSize({ mem->getSize[0], 1u, 1u, 1u, 1u })
-					->setStrides({ mem->getSize[0], 1u, 1u, 1u, 1u })
-					->setAlignment(mem->getAlignment())
-					->setIsNeeded(false)
-					->setUseIndirection(false);
-				TensorDesc* filledL2Norm = new TensorDesc(mem);
-			
-				Operation_Pointwise* weightSquaring = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_SQUARE)
-					->setInTensor(mem)
-					->setOutTensor(mem_squared)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Reduce* reduceSquaredGradients = new Operation_Reduce()
-					->setInTensor(mem_squared)
-					->setOutTensor(l2GradientNorm)
-					->setReduceDimensions({ 2u,3u,4u }) //All spatial dimension
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Pointwise* rootNorm = new Operation_Pointwise()
-					->setPointwiseType(POINTWISE_TYPE::POINTWISE_ROOT)
-					->setInTensor(l2GradientNorm)
-					->setOutTensor(l2GradientNorm)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Fill* fillNorm = new Operation_Fill()
-					->setConstant(l2GradientNorm)
-					->setOutTensor(filledL2Norm)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Binary* normalizeWeights = new Operation_Binary()
-					->setBinaryType(BINARY_TYPE::BINARY_DIV)
-					->setInTensors(mem, fillNorm)
-					->setOutTensor(mem_normalized)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-
-				graph->addNode(weightSquaring);
-				graph->addNode(reduceSquaredGradients);
-				graph->addNode(rootNorm);
-				graph->addNode(fillNorm);
-				graph->addNode(normalizeWeights);
-
-				TensorDesc* dotp_unreduced = new TensorDesc(step);
-				TensorDesc* dotp_reduced   = new TensorDesc()
-					->setTypeId(this->data_type)
-					->setSize({ step->getSize[0], 1u, 1u, 1u, 1u })
-					->setStrides({ step->getSize[0], 1u, 1u, 1u, 1u })
-					->setAlignment(step->getAlignment())
-					->setIsNeeded(false)
-					->setUseIndirection(false);
-				TensorDesc* dotp_filled    = new TensorDesc(step);
-
-				Operation_Binary* computeDotp = new Operation_Binary()
-					->setBinaryType(BINARY_TYPE::BINARY_MUL)
-					->setInTensors(mem_normalized, step)
-					->setOutTensor(dotp_unreduced)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Reduce* reduceDotp = new Operation_Reduce()
-					->setReduceType(REDUCE_TYPE::SUM)
-					->setInTensor(dotp_unreduced)
-					->setOutTensor(dotp_reduced)
-					->setReduceDimensions({ 2u,3u,4u }) //All spatial dimensions
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Fill* fillDotp = new Operation_Fill()
-					->setBlendConstants(dotp_reduced)
-					->setOutTensor(dotp_filled)
-					->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-						});
-				Operation_Binary* projectStep = new Operation_Binary()
-					->setBinaryType(BINARY_TYPE::BINARY_MUL)
-					->setInTensors(dotp_filled, mem_normalized)
-					->setOutTensor(step)
-					->setBlendConstants({
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-							new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0)
-						});
-				graph->addNode(computeDotp);
-				graph->addNode(reduceDotp);
-				graph->addNode(fillDotp);
-				graph->addNode(projectStep);
-			}
-		}
-
-		//6.3.: Centralization
-		if constexpr (centralize == CENTRALIZATION::STEP) {
-			TensorDesc* step_mean = new TensorDesc()
-				->setTypeId(this->data_type)
-				->setSize({ step->getSize[0], 1u, 1u, 1u, 1u })
-				->setStrides({ step->getSize[0], 1u, 1u, 1u, 1u })
-				->setAlignment(step->getAlignment())
-				->setIsNeeded(false)
-				->setUseIndirection(false);
-			Operation_Reduce* computeMean = new Operation_Reduce()
-				->setInTensor(step)
-				->setOutTensor(step_mean)
-				->setReduceDimensions({ 2u,3u,4u }) //All spatial dimensions
-				->setReduceType(REDUCE_TYPE::MEAN)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			Operation_Fill* stepShift = new Operation_Fill()
-				->setConstant(step_mean)
-				->setOutTensor(step)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-					});
-			graph->addNode(computeMean);
-			graph->addNode(stepShift);
-		}
-
-		//7.: Apply step
-		Operation_Copy* applyStep = new Operation_Copy()
-			->setInTensor(step)
-			->setOutTensor(mem)
-			->setBlendConstants({
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(-1.0),
-					new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-				});
-		graph->addNode(applyStep);
-
-		//8.: Save debug information
-		switch (debug) {
-		case DEBUG_INFO::NONE:
-			break;
-		case DEBUG_INFO::GRADIENT:
-			Operation_Copy* saveGrad = new Operation_Copy()
-				->setInTensor(deltas)
-				->setOutTensor(associatedBufs[debug_idx])
-				->setBlendConstants({
-						new ConstantDesc()->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc()->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(saveGrad);
-			break;
-		case DEBUG_INFO::STEP:
-			Operation_Copy* saveStep = new Operation_Copy()
-				->setInTensor(step)
-				->setOutTensor(associatedBufs[debug_idx])
-				->setBlendConstants({
-						new ConstantDesc()->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc()->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(saveStep);
-			break;
-		case DEBUG_INFO::MOMENTUM_BUF:
-			Operation_Copy* saveMomentum = new Operation_Copy()
-				->setInTensor(associatedBufs[momentum_idx)
-				->setOutTensor(associatedBufs[debug_idx])
-				->setBlendConstants({
-						new ConstantDesc()->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc()->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(saveMomentum);
-			break;
-		case DEBUG_INFO::ADAPTIVE_BUF:
-			Operation_Copy* saveAdaptive = new Operation_Copy()
-				->setInTensor(associatedBufs[adaptive_idx])
-				->setOutTensor(associatedBufs[debug_idx])
-				->setBlendConstants({
-						new ConstantDesc()->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc()->setUseIndirection(false)->setValue(0.0)
-					});
-			graph->addNode(saveAdaptive);
-			break;
-		}
-
-		//9.: Lookahead
-		if constexpr (lookahead > 0) {
-			Operation_If* lookahead_condition = new Operation_If()
-				->setConditionConstant(this->constants[lookaheadSyncBool_idx]);
-			Operation_Binary* updateSlow = new Operation_Binary()
-				->setBinaryType(BINARY_TYPE::BINARY_SUB)
-				->setInTensors(mem, associatedBufs[lookahead_idx])
-				->setOutTensor(associtedBufs[lookahead_idx)
-				->setBlendConstants({
-						this->constants[lookaheadStepSize_idx],
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0)
-					});
-			Operation_Copy* updateFast = new Operation_Copy()
-				->setInTensor(associatedBufs[lookahead_idx])
-				->setOutTensor(mem)
-				->setBlendConstants({
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(1.0),
-						new ConstantDesc(this->data_type)->setUseIndirection(false)->setValue(0.0)
-					});
-			lookahead_condition->addOperationTrue(updateSlow);
-			lookahead_condition->addOperationTrue(updateFast);
-			graph->addNode(lookahead_condition);
-		}
-			
-		//10.: Update LR buffer
-		if (delta_lr) {
-			Operation_Copy* deltaLr_upd = new Operation_Copy()
-				->setInTensor(step)
-				->setOutTensor(associatedBufs[delta_idx])
-				->setBlendConstants({ this->constants[oldStepNew_idx], this->constants[oldStepsDecay_idx] });
-			graph->addNode(deltaLr_upd);
-		}
-	}
-
-	virtual void initMem() override { /*TODO*/ }
-	virtual void setLearningRates(double alpha, double beta1 = -1., double beta2 = -1.) override {
-		this->constants[0]->setValue(-alpha);
-	
-	
-		//debiasing is hard for nestrov 1-beta^(t+1).
-	}
-
-	virtual OPTIMIZER_TYPE getType() const override {
-		return
-	}
-};
-
-
 
 
 class Zero_Order_Optimizer {}; //Gridsearch, approx gradient, ...
